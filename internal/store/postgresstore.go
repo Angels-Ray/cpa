@@ -84,6 +84,10 @@ func NewPostgresStore(ctx context.Context, cfg PostgresStoreConfig) (*PostgresSt
 	if err != nil {
 		return nil, fmt.Errorf("postgres store: open database connection: %w", err)
 	}
+	db.SetMaxOpenConns(25)
+	db.SetMaxIdleConns(10)
+	db.SetConnMaxLifetime(5 * time.Minute)
+	db.SetConnMaxIdleTime(1 * time.Minute)
 	if err = db.PingContext(ctx); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("postgres store: ping database: %w", err)
