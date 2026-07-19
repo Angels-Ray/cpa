@@ -207,6 +207,9 @@ func (s *PostgresStore) WorkDir() string {
 func (s *PostgresStore) SetBaseDir(string) {}
 
 // Save persists authentication metadata to disk and PostgreSQL.
+// Preparatory work (directory creation, metadata serialisation, attribute
+// updates) is performed outside the mutex; only the file write and database
+// upsert are serialised.
 func (s *PostgresStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (string, error) {
 	if auth == nil {
 		return "", fmt.Errorf("postgres store: auth is nil")
@@ -226,15 +229,30 @@ func (s *PostgresStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (stri
 		}
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	if err = os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return "", fmt.Errorf("postgres store: create auth directory: %w", err)
 	}
 
+	if auth.Attributes == nil {
+		auth.Attributes = make(map[string]string)
+	}
+	auth.Attributes[cliproxyauth.AttributePath] = path
+	auth.Attributes[cliproxyauth.AttributeSourceBackend] = cliproxyauth.AuthSourcePostgres
+	if strings.TrimSpace(auth.FileName) == "" {
+		auth.FileName = auth.ID
+	}
+
+	relID, err := s.relativeAuthID(path)
+	if err != nil {
+		return "", err
+	}
+
+	// Serialise payload outside the lock.
+	var raw []byte
+	var useStorage bool
 	switch {
 	case auth.Storage != nil:
+		useStorage = true
 		if auth.Metadata == nil {
 			auth.Metadata = make(map[string]any)
 		}
@@ -242,15 +260,25 @@ func (s *PostgresStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (stri
 		if setter, ok := auth.Storage.(interface{ SetMetadata(map[string]any) }); ok {
 			setter.SetMetadata(auth.Metadata)
 		}
+	case auth.Metadata != nil:
+		auth.Metadata["disabled"] = auth.Disabled
+		raw, err = json.Marshal(auth.Metadata)
+		if err != nil {
+			return "", fmt.Errorf("postgres store: marshal metadata: %w", err)
+		}
+	default:
+		return "", fmt.Errorf("postgres store: nothing to persist for %s", auth.ID)
+	}
+
+	// Only the file write and database upsert are serialised.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if useStorage {
 		if err = auth.Storage.SaveTokenToFile(path); err != nil {
 			return "", err
 		}
-	case auth.Metadata != nil:
-		auth.Metadata["disabled"] = auth.Disabled
-		raw, errMarshal := json.Marshal(auth.Metadata)
-		if errMarshal != nil {
-			return "", fmt.Errorf("postgres store: marshal metadata: %w", errMarshal)
-		}
+	} else {
 		if existing, errRead := os.ReadFile(path); errRead == nil {
 			if jsonEqual(existing, raw) {
 				return path, nil
@@ -265,24 +293,8 @@ func (s *PostgresStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (stri
 		if errRename := os.Rename(tmp, path); errRename != nil {
 			return "", fmt.Errorf("postgres store: rename auth file: %w", errRename)
 		}
-	default:
-		return "", fmt.Errorf("postgres store: nothing to persist for %s", auth.ID)
 	}
 
-	if auth.Attributes == nil {
-		auth.Attributes = make(map[string]string)
-	}
-	auth.Attributes[cliproxyauth.AttributePath] = path
-	auth.Attributes[cliproxyauth.AttributeSourceBackend] = cliproxyauth.AuthSourcePostgres
-
-	if strings.TrimSpace(auth.FileName) == "" {
-		auth.FileName = auth.ID
-	}
-
-	relID, err := s.relativeAuthID(path)
-	if err != nil {
-		return "", err
-	}
 	data, errRead := os.ReadFile(path)
 	if errRead != nil {
 		return "", fmt.Errorf("postgres store: read auth file for upsert: %w", errRead)
