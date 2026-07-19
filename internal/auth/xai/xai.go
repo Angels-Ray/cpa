@@ -460,17 +460,14 @@ func parseJWTIdentity(token string) (email string, subject string) {
 	if err != nil {
 		return "", ""
 	}
-	var claims map[string]any
+	var claims struct {
+		Email string `json:"email"`
+		Sub   string `json:"sub"`
+	}
 	if err = json.Unmarshal(raw, &claims); err != nil {
 		return "", ""
 	}
-	if v, ok := claims["email"].(string); ok {
-		email = strings.TrimSpace(v)
-	}
-	if v, ok := claims["sub"].(string); ok {
-		subject = strings.TrimSpace(v)
-	}
-	return email, subject
+	return strings.TrimSpace(claims.Email), strings.TrimSpace(claims.Sub)
 }
 
 func firstNonEmpty(values ...string) string {
