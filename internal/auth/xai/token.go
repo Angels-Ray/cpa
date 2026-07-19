@@ -40,8 +40,6 @@ func (ts *TokenStorage) SetMetadata(meta map[string]any) {
 // SaveTokenToFile writes xAI credentials to a JSON auth file.
 func (ts *TokenStorage) SaveTokenToFile(authFilePath string) error {
 	misc.LogSavingCredentials(authFilePath)
-	ts.Type = "xai"
-	ts.AuthKind = "oauth"
 	if errMkdirAll := os.MkdirAll(filepath.Dir(authFilePath), 0o700); errMkdirAll != nil {
 		return fmt.Errorf("xai token storage: create directory: %w", errMkdirAll)
 	}
@@ -55,9 +53,47 @@ func (ts *TokenStorage) SaveTokenToFile(authFilePath string) error {
 		}
 	}()
 
-	data, errMerge := misc.MergeMetadata(ts, ts.Metadata)
-	if errMerge != nil {
-		return fmt.Errorf("xai token storage: merge metadata: %w", errMerge)
+	data := make(map[string]any, 22)
+	data["type"] = "xai"
+	data["auth_kind"] = "oauth"
+	if ts.AccessToken != "" {
+		data["access_token"] = ts.AccessToken
+	}
+	if ts.RefreshToken != "" {
+		data["refresh_token"] = ts.RefreshToken
+	}
+	if ts.IDToken != "" {
+		data["id_token"] = ts.IDToken
+	}
+	if ts.TokenType != "" {
+		data["token_type"] = ts.TokenType
+	}
+	if ts.ExpiresIn > 0 {
+		data["expires_in"] = ts.ExpiresIn
+	}
+	if ts.Expire != "" {
+		data["expired"] = ts.Expire
+	}
+	if ts.LastRefresh != "" {
+		data["last_refresh"] = ts.LastRefresh
+	}
+	if ts.Email != "" {
+		data["email"] = ts.Email
+	}
+	if ts.Subject != "" {
+		data["sub"] = ts.Subject
+	}
+	if ts.BaseURL != "" {
+		data["base_url"] = ts.BaseURL
+	}
+	if ts.RedirectURI != "" {
+		data["redirect_uri"] = ts.RedirectURI
+	}
+	if ts.TokenEndpoint != "" {
+		data["token_endpoint"] = ts.TokenEndpoint
+	}
+	for k, v := range ts.Metadata {
+		data[k] = v
 	}
 	encoder := json.NewEncoder(file)
 	encoder.SetIndent("", "  ")
