@@ -34,6 +34,10 @@ import (
 var (
 	xaiDataTag  = []byte("data:")
 	xaiEventTag = []byte("event:")
+
+	imageKeyBytes    = []byte(`"image"`)
+	imagesKeyBytes   = []byte(`"images"`)
+	refImagesKeyBytes = []byte(`"reference_images"`)
 )
 
 const (
@@ -1217,7 +1221,11 @@ func xaiImageEndpointPath(opts cliproxyexecutor.Options) string {
 // including nested objects and array items. Does not rewrite chat content
 // parts shaped as {"type":"image_url","image_url":{...}}.
 func normalizeXAIImageRefs(body []byte) []byte {
+
 	if !gjson.ValidBytes(body) {
+		return body
+	}
+	if !bytes.Contains(body, imageKeyBytes) && !bytes.Contains(body, imagesKeyBytes) && !bytes.Contains(body, refImagesKeyBytes) {
 		return body
 	}
 
