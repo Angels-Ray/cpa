@@ -1,172 +1,268 @@
 package responses
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
 
-	translatorcommon "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/common"
 	log "github.com/sirupsen/logrus"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
 func ConvertOpenAIResponsesRequestToCodex(modelName string, inputRawJSON []byte, _ bool) []byte {
-	rawJSON := inputRawJSON
+	_ = modelName
 
-	inputResult := gjson.GetBytes(rawJSON, "input")
-	if inputResult.Type == gjson.String {
-		input, _ := sjson.SetBytes([]byte(`[{"type":"message","role":"user","content":[{"type":"input_text","text":""}]}]`), "0.content.0.text", inputResult.String())
-		rawJSON, _ = sjson.SetRawBytes(rawJSON, "input", input)
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(inputRawJSON, &m); err != nil {
+		return inputRawJSON
 	}
 
-	rawJSON, _ = sjson.SetBytes(rawJSON, "stream", true)
-	rawJSON, _ = sjson.SetBytes(rawJSON, "store", false)
-	rawJSON, _ = sjson.SetBytes(rawJSON, "parallel_tool_calls", true)
-	rawJSON, _ = sjson.SetBytes(rawJSON, "include", []string{"reasoning.encrypted_content"})
-	// Codex Responses rejects token limit fields, so strip them out before forwarding.
-	rawJSON, _ = sjson.DeleteBytes(rawJSON, "max_output_tokens")
-	rawJSON, _ = sjson.DeleteBytes(rawJSON, "max_completion_tokens")
-	rawJSON, _ = sjson.DeleteBytes(rawJSON, "temperature")
-	rawJSON, _ = sjson.DeleteBytes(rawJSON, "top_p")
-	if v := gjson.GetBytes(rawJSON, "service_tier"); v.Exists() {
-		if v.String() != "priority" {
-			rawJSON, _ = sjson.DeleteBytes(rawJSON, "service_tier")
+	if inputRaw, ok := m["input"]; ok {
+		trimmed := bytes.TrimSpace(inputRaw)
+		if len(trimmed) > 0 {
+			switch trimmed[0] {
+			case '"':
+				var s string
+				if err := json.Unmarshal(trimmed, &s); err == nil {
+					wrapped, err := json.Marshal([]codexInputMessage{{
+						Type: "message",
+						Role: "user",
+						Content: []codexInputContent{
+							{Type: "input_text", Text: s},
+						},
+					}})
+					if err == nil {
+						m["input"] = wrapped
+					}
+				}
+			case '[':
+				if rewritten := convertInputArraySystemRole(trimmed); !bytes.Equal(rewritten, trimmed) {
+					m["input"] = rewritten
+				}
+			}
 		}
 	}
 
-	rawJSON, _ = sjson.DeleteBytes(rawJSON, "truncation")
-	rawJSON = applyResponsesCompactionCompatibility(rawJSON)
+	m["stream"] = json.RawMessage("true")
+	m["store"] = json.RawMessage("false")
+	m["parallel_tool_calls"] = json.RawMessage("true")
+	m["include"] = json.RawMessage(`["reasoning.encrypted_content"]`)
 
-	// Delete the user field as it is not supported by the Codex upstream.
-	rawJSON, _ = sjson.DeleteBytes(rawJSON, "user")
+	delete(m, "max_output_tokens")
+	delete(m, "max_completion_tokens")
+	delete(m, "temperature")
+	delete(m, "top_p")
+	delete(m, "truncation")
+	delete(m, "user")
+	delete(m, "context_management")
 
-	// Convert role "system" to "developer" in input array to comply with Codex API requirements.
-	rawJSON = convertSystemRoleToDeveloper(rawJSON)
-	rawJSON = normalizeCodexBuiltinTools(rawJSON)
-
-	return rawJSON
-}
-
-// applyResponsesCompactionCompatibility handles OpenAI Responses context_management.compaction
-// for Codex upstream compatibility.
-//
-// Codex /responses currently rejects context_management with:
-// {"detail":"Unsupported parameter: context_management"}.
-//
-// Compatibility strategy:
-// 1) Remove context_management before forwarding to Codex upstream.
-func applyResponsesCompactionCompatibility(rawJSON []byte) []byte {
-	if !gjson.GetBytes(rawJSON, "context_management").Exists() {
-		return rawJSON
+	if raw, ok := m["service_tier"]; ok {
+		var tier string
+		if err := json.Unmarshal(raw, &tier); err != nil || tier != "priority" {
+			delete(m, "service_tier")
+		}
 	}
 
-	rawJSON, _ = sjson.DeleteBytes(rawJSON, "context_management")
-	return rawJSON
-}
-
-// convertSystemRoleToDeveloper traverses the input array and converts any message items
-// with role "system" to role "developer". This is necessary because Codex API does not
-// accept "system" role in the input array.
-func convertSystemRoleToDeveloper(rawJSON []byte) []byte {
-	inputResult := gjson.GetBytes(rawJSON, "input")
-	if !inputResult.IsArray() {
-		return rawJSON
+	out, err := json.Marshal(m)
+	if err != nil {
+		return inputRawJSON
 	}
 
-	inputItems := inputResult.Array()
-	if len(inputItems) == 0 {
+	out = normalizeCodexBuiltinTools(out)
+	return out
+}
+
+type codexInputContent struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+}
+
+type codexInputMessage struct {
+	Type    string              `json:"type"`
+	Role    string              `json:"role"`
+	Content []codexInputContent `json:"content"`
+}
+
+func convertInputArraySystemRole(rawJSON []byte) []byte {
+	var elems []json.RawMessage
+	if err := json.Unmarshal(rawJSON, &elems); err != nil {
 		return rawJSON
 	}
 
 	changed := false
-	rebuiltInput := make([]json.RawMessage, 0, len(inputItems))
-	for _, item := range inputItems {
-		itemRaw := []byte(item.Raw)
-		if item.IsObject() && item.Get("role").String() == "system" {
-			updatedItem, errSetItem := sjson.SetRawBytes(itemRaw, "role", []byte(`"developer"`))
-			if errSetItem != nil {
-				return rawJSON
-			}
-			itemRaw = updatedItem
-			changed = true
+	for i, elem := range elems {
+		var obj map[string]json.RawMessage
+		if err := json.Unmarshal(elem, &obj); err != nil {
+			continue
 		}
-		rebuiltInput = append(rebuiltInput, json.RawMessage(itemRaw))
+		roleRaw, ok := obj["role"]
+		if !ok {
+			continue
+		}
+		var role string
+		if err := json.Unmarshal(roleRaw, &role); err != nil {
+			continue
+		}
+		if role != "system" {
+			continue
+		}
+
+		obj["role"] = json.RawMessage(`"developer"`)
+		newElem, err := json.Marshal(obj)
+		if err != nil {
+			continue
+		}
+		elems[i] = newElem
+		changed = true
 	}
+
 	if !changed {
 		return rawJSON
 	}
+	out, err := json.Marshal(elems)
+	if err != nil {
+		return rawJSON
+	}
+	return out
+}
 
-	inputRaw, errMarshalInput := json.Marshal(rebuiltInput)
-	if errMarshalInput != nil {
+// convertSystemRoleToDeveloper extracts the "input" array from a full
+// Responses API request JSON, converts any "system" roles to "developer",
+// and returns the updated JSON.
+func convertSystemRoleToDeveloper(rawJSON []byte) []byte {
+	inputRaw := json.RawMessage(rawJSON)
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(inputRaw, &m); err != nil {
 		return rawJSON
 	}
-	updated, errSetInput := sjson.SetRawBytes(rawJSON, "input", inputRaw)
-	if errSetInput != nil {
+	inputArr, ok := m["input"]
+	if !ok {
 		return rawJSON
 	}
-	return updated
+	rewritten := convertInputArraySystemRole(inputArr)
+	if bytes.Equal(rewritten, inputArr) {
+		return rawJSON
+	}
+	m["input"] = rewritten
+	out, err := json.Marshal(m)
+	if err != nil {
+		return rawJSON
+	}
+	return out
 }
 
 // normalizeCodexBuiltinTools rewrites legacy/preview built-in tool variants to the
 // stable names expected by the current Codex upstream.
 func normalizeCodexBuiltinTools(rawJSON []byte) []byte {
-	result := normalizeCodexBuiltinToolArray(rawJSON, "tools")
-	result = normalizeCodexBuiltinToolAtPath(result, "tool_choice.type")
-	return normalizeCodexBuiltinToolArray(result, "tool_choice.tools")
-}
-
-func normalizeCodexBuiltinToolArray(rawJSON []byte, path string) []byte {
-	tools := gjson.GetBytes(rawJSON, path)
-	if !tools.IsArray() {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(rawJSON, &m); err != nil {
 		return rawJSON
 	}
 
 	changed := false
-	var toolItems [][]byte
-	tools.ForEach(func(_, tool gjson.Result) bool {
-		item := []byte(tool.Raw)
-		currentType := tool.Get("type").String()
-		normalizedType := normalizeCodexBuiltinToolType(currentType)
-		if normalizedType != "" {
-			updated, errSetType := sjson.SetBytes(item, "type", normalizedType)
-			if errSetType == nil {
-				item = updated
-				changed = true
-				log.Debugf("codex responses: normalized builtin tool type at %s.%d.type from %q to %q", path, len(toolItems), currentType, normalizedType)
+
+	if rawTools, ok := m["tools"]; ok {
+		if updated := normalizeBuiltinToolArray(rawTools); updated != nil {
+			m["tools"] = updated
+			changed = true
+		}
+	}
+
+	if rawChoice, ok := m["tool_choice"]; ok {
+		first := firstNonSpaceByte(rawChoice)
+		if first == '{' {
+			var choiceObj map[string]json.RawMessage
+			if err := json.Unmarshal(rawChoice, &choiceObj); err == nil {
+				if updatedType := normalizeBuiltinToolAtKey(choiceObj, "type"); updatedType {
+					if newChoice, err := json.Marshal(choiceObj); err == nil {
+						m["tool_choice"] = newChoice
+						changed = true
+					}
+				}
+				if rawChoiceTools, ok := choiceObj["tools"]; ok {
+					if updated := normalizeBuiltinToolArray(rawChoiceTools); updated != nil {
+						choiceObj["tools"] = updated
+						if newChoice, err := json.Marshal(choiceObj); err == nil {
+							m["tool_choice"] = newChoice
+							changed = true
+						}
+					}
+				}
 			}
 		}
-		toolItems = append(toolItems, item)
-		return true
-	})
+	}
+
 	if !changed {
 		return rawJSON
 	}
-
-	updated, errSetTools := sjson.SetRawBytes(rawJSON, path, translatorcommon.JoinRawArray(toolItems))
-	if errSetTools != nil {
-		return rawJSON
-	}
-	return updated
-}
-
-func normalizeCodexBuiltinToolAtPath(rawJSON []byte, path string) []byte {
-	currentType := gjson.GetBytes(rawJSON, path).String()
-	normalizedType := normalizeCodexBuiltinToolType(currentType)
-	if normalizedType == "" {
-		return rawJSON
-	}
-
-	updated, err := sjson.SetBytes(rawJSON, path, normalizedType)
+	out, err := json.Marshal(m)
 	if err != nil {
 		return rawJSON
 	}
+	return out
+}
 
-	log.Debugf("codex responses: normalized builtin tool type at %s from %q to %q", path, currentType, normalizedType)
-	return updated
+func normalizeBuiltinToolArray(raw json.RawMessage) json.RawMessage {
+	var items []json.RawMessage
+	if err := json.Unmarshal(raw, &items); err != nil {
+		return nil
+	}
+
+	changed := false
+	for i, item := range items {
+		var obj map[string]json.RawMessage
+		if err := json.Unmarshal(item, &obj); err != nil {
+			continue
+		}
+		typeRaw, ok := obj["type"]
+		if !ok {
+			continue
+		}
+		var toolType string
+		if err := json.Unmarshal(typeRaw, &toolType); err != nil {
+			continue
+		}
+		normalized := normalizeCodexBuiltinToolType(toolType)
+		if normalized == "" {
+			continue
+		}
+		log.Debugf("codex responses: normalized builtin tool type at tools.%d.type from %q to %q", i, toolType, normalized)
+		obj["type"] = json.RawMessage(fmt.Sprintf(`"%s"`, normalized))
+		if newItem, err := json.Marshal(obj); err == nil {
+			items[i] = newItem
+		}
+		changed = true
+	}
+
+	if !changed {
+		return nil
+	}
+	out, err := json.Marshal(items)
+	if err != nil {
+		return nil
+	}
+	return out
+}
+
+func normalizeBuiltinToolAtKey(obj map[string]json.RawMessage, key string) bool {
+	raw, ok := obj[key]
+	if !ok {
+		return false
+	}
+	var toolType string
+	if err := json.Unmarshal(raw, &toolType); err != nil {
+		return false
+	}
+	normalized := normalizeCodexBuiltinToolType(toolType)
+	if normalized == "" {
+		return false
+	}
+	log.Debugf("codex responses: normalized builtin tool type at %s from %q to %q", key, toolType, normalized)
+	obj[key] = json.RawMessage(fmt.Sprintf(`"%s"`, normalized))
+	return true
 }
 
 // normalizeCodexBuiltinToolType centralizes the current known Codex Responses
-// built-in tool alias compatibility. If Codex introduces more legacy aliases,
-// extend this helper instead of adding path-specific rewrite logic elsewhere.
+// built-in tool alias compatibility.
 func normalizeCodexBuiltinToolType(toolType string) string {
 	switch toolType {
 	case "web_search_preview", "web_search_preview_2025_03_11":
@@ -174,4 +270,16 @@ func normalizeCodexBuiltinToolType(toolType string) string {
 	default:
 		return ""
 	}
+}
+
+func firstNonSpaceByte(raw json.RawMessage) byte {
+	for _, b := range raw {
+		switch b {
+		case ' ', '\n', '\r', '\t':
+			continue
+		default:
+			return b
+		}
+	}
+	return 0
 }
