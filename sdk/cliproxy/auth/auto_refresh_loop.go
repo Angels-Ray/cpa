@@ -268,6 +268,8 @@ func (l *authAutoRefreshLoop) handleDueAuth(ctx context.Context, now time.Time, 
 	case <-ctx.Done():
 		return
 	case l.jobs <- authID:
+	default:
+		l.upsert(authID, now.Add(l.interval))
 	}
 }
 

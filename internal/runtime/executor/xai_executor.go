@@ -96,7 +96,7 @@ func (e *XAIExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Auth)
 	if req == nil {
 		return nil
 	}
-	token, _ := xaiCreds(auth)
+	token := xaiToken(auth)
 	if strings.TrimSpace(token) != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
@@ -998,6 +998,16 @@ func xaiCreds(auth *cliproxyauth.Auth) (token, baseURL string) {
 	return token, baseURL
 }
 
+func xaiToken(auth *cliproxyauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if v := strings.TrimSpace(auth.Attributes["api_key"]); v != "" {
+		return v
+	}
+	return xaiMetadataString(auth.Metadata, "access_token")
+}
+
 // xaiUsingAPI reports whether this xAI auth should use the official API path
 // for non-media HTTP chat. OAuth defaults to false to use Grok Build.
 func xaiUsingAPI(auth *cliproxyauth.Auth) bool {
@@ -1042,8 +1052,12 @@ func xaiUsingAPI(auth *cliproxyauth.Auth) bool {
 // cli-chat-proxy only accepts HTTP POST chat and does not implement
 // /responses/compact (404) or websocket upgrades (405).
 func xaiChatBaseURL(auth *cliproxyauth.Auth) string {
+	return xaiChatBaseURLForAuth(auth, xaiUsingAPI(auth))
+}
+
+func xaiChatBaseURLForAuth(auth *cliproxyauth.Auth, usingAPI bool) string {
 	_, baseURL := xaiCreds(auth)
-	if xaiUsingAPI(auth) {
+	if usingAPI {
 		if baseURL == "" {
 			return xaiauth.DefaultAPIBaseURL
 		}
@@ -1131,12 +1145,13 @@ func applyXAICustomHeaders(r *http.Request, auth *cliproxyauth.Auth) {
 // when using_api is false and the resolved chat base URL is the official CLI
 // chat-proxy endpoint.
 func applyXAIChatHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, sessionID string) {
-	if xaiUsingAPI(auth) {
+	usingAPI := xaiUsingAPI(auth)
+	if usingAPI {
 		applyXAIHeaders(r, auth, token, stream, sessionID)
 		return
 	}
 	applyXAIDefaultHeaders(r, token, stream, sessionID)
-	if xaiIsCLIChatProxyBaseURL(xaiChatBaseURL(auth)) {
+	if xaiIsCLIChatProxyBaseURL(xaiChatBaseURLForAuth(auth, usingAPI)) {
 		r.Header.Set(xaiTokenAuthHeader, xaiTokenAuthValue)
 		r.Header.Set(xaiClientVersionHeader, xaiClientVersionValue)
 		r.Header.Set("User-Agent", "xai-grok-workspace/"+xaiClientVersionValue)
