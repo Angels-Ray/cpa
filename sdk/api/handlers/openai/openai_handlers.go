@@ -43,6 +43,18 @@ func NewOpenAIAPIHandler(apiHandlers *handlers.BaseAPIHandler) *OpenAIAPIHandler
 	}
 }
 
+var (
+	sseDataPrefix = []byte("data: ")
+	sseDataSuffix = []byte("\n\n")
+	sseDoneChunk  = []byte("data: [DONE]\n\n")
+)
+
+func writeSSEData(w http.ResponseWriter, payload []byte) {
+	_, _ = w.Write(sseDataPrefix)
+	_, _ = w.Write(payload)
+	_, _ = w.Write(sseDataSuffix)
+}
+
 // HandlerType returns the identifier for this handler implementation.
 func (h *OpenAIAPIHandler) HandlerType() string {
 	return OpenAI
@@ -503,7 +515,7 @@ func (h *OpenAIAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON []byt
 				// Stream closed without data? Send DONE or just headers.
 				setSSEHeaders()
 				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
-				_, _ = fmt.Fprintf(c.Writer, "data: [DONE]\n\n")
+				_, _ = c.Writer.Write(sseDoneChunk)
 				flusher.Flush()
 				cliCancel(nil)
 				return
@@ -513,7 +525,7 @@ func (h *OpenAIAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON []byt
 			setSSEHeaders()
 			handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 
-			_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(chunk))
+			writeSSEData(c.Writer, chunk)
 			flusher.Flush()
 
 			// Continue streaming the rest
@@ -609,7 +621,7 @@ func (h *OpenAIAPIHandler) handleCompletionsStreamingResponse(c *gin.Context, ra
 			if !ok {
 				setSSEHeaders()
 				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
-				_, _ = fmt.Fprintf(c.Writer, "data: [DONE]\n\n")
+				_, _ = c.Writer.Write(sseDoneChunk)
 				flusher.Flush()
 				cliCancel(nil)
 				return
@@ -665,7 +677,7 @@ func (h *OpenAIAPIHandler) handleCompletionsStreamingResponse(c *gin.Context, ra
 func (h *OpenAIAPIHandler) handleStreamResult(c *gin.Context, flusher http.Flusher, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage) {
 	h.ForwardStream(c, flusher, cancel, data, errs, handlers.StreamForwardOptions{
 		WriteChunk: func(chunk []byte) {
-			_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(chunk))
+			writeSSEData(c.Writer, chunk)
 		},
 		WriteTerminalError: func(errMsg *interfaces.ErrorMessage) {
 			if errMsg == nil {
