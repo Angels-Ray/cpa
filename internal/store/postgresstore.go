@@ -282,7 +282,11 @@ func (s *PostgresStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (stri
 	if err != nil {
 		return "", err
 	}
-	if err = s.upsertAuthRecord(ctx, relID, path); err != nil {
+	data, errRead := os.ReadFile(path)
+	if errRead != nil {
+		return "", fmt.Errorf("postgres store: read auth file for upsert: %w", errRead)
+	}
+	if err = s.upsertAuthRecord(ctx, relID, data); err != nil {
 		return "", err
 	}
 	return path, nil
@@ -526,11 +530,7 @@ func (s *PostgresStore) syncAuthFile(ctx context.Context, relID, path string) er
 	return s.persistAuth(ctx, relID, data)
 }
 
-func (s *PostgresStore) upsertAuthRecord(ctx context.Context, relID, path string) error {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return fmt.Errorf("postgres store: read auth file: %w", err)
-	}
+func (s *PostgresStore) upsertAuthRecord(ctx context.Context, relID string, data []byte) error {
 	if len(data) == 0 {
 		return s.deleteAuthRecord(ctx, relID)
 	}
