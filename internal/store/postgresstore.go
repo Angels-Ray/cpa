@@ -574,7 +574,10 @@ func (s *PostgresStore) syncConfigFromDatabase(ctx context.Context, exampleConfi
 	return nil
 }
 
-// syncAuthFromDatabase populates the local auth directory from PostgreSQL data.
+// syncAuthFromDatabase populates the local auth directory from PostgreSQL data
+// using an incremental approach: existing files with matching content are left
+// untouched, new and changed rows are written, and files without a
+// corresponding database row are removed.
 func (s *PostgresStore) syncAuthFromDatabase(ctx context.Context) error {
 	query := fmt.Sprintf("SELECT id, content FROM %s", s.fullTableName(s.cfg.AuthTable))
 	rows, err := s.db.QueryContext(ctx, query)
@@ -583,11 +586,18 @@ func (s *PostgresStore) syncAuthFromDatabase(ctx context.Context) error {
 	}
 	defer rows.Close()
 
-	if err = os.RemoveAll(s.authDir); err != nil {
-		return fmt.Errorf("postgres store: reset auth directory: %w", err)
-	}
-	if err = os.MkdirAll(s.authDir, 0o700); err != nil {
-		return fmt.Errorf("postgres store: recreate auth directory: %w", err)
+	// Collect files already on disk so we can remove orphans afterwards.
+	onDisk := make(map[string]struct{})
+	if walkErr := filepath.WalkDir(s.authDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if !d.IsDir() {
+			onDisk[path] = struct{}{}
+		}
+		return nil
+	}); walkErr != nil && !errors.Is(walkErr, fs.ErrNotExist) {
+		log.WithError(walkErr).Warn("postgres store: walking auth dir for sync, orphan cleanup may be incomplete")
 	}
 
 	for rows.Next() {
@@ -603,6 +613,15 @@ func (s *PostgresStore) syncAuthFromDatabase(ctx context.Context) error {
 			log.WithError(errPath).Warnf("postgres store: skipping auth %s outside spool", id)
 			continue
 		}
+		delete(onDisk, path)
+
+		// Skip write when the on-disk file already matches the database content
+		// to avoid unnecessary disk I/O and watcher events.
+		if existing, errRead := os.ReadFile(path); errRead == nil {
+			if string(existing) == payload {
+				continue
+			}
+		}
 		if err = os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 			return fmt.Errorf("postgres store: create auth subdir: %w", err)
 		}
@@ -612,6 +631,13 @@ func (s *PostgresStore) syncAuthFromDatabase(ctx context.Context) error {
 	}
 	if err = rows.Err(); err != nil {
 		return fmt.Errorf("postgres store: iterate auth rows: %w", err)
+	}
+
+	// Remove files left on disk that no longer exist in the database.
+	for path := range onDisk {
+		if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			log.WithError(err).Warnf("postgres store: remove orphan auth file %s", path)
+		}
 	}
 	return nil
 }
