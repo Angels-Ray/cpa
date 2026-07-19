@@ -23,6 +23,7 @@ const (
 	defaultConfigTable = "config_store"
 	defaultAuthTable   = "auth_store"
 	defaultConfigKey   = "config"
+	authBatchSize      = 500
 )
 
 // PostgresStoreConfig captures configuration required to initialize a Postgres-backed store.
@@ -426,7 +427,8 @@ func (s *PostgresStore) Delete(ctx context.Context, id string) error {
 	return s.deleteAuthRecord(ctx, relID)
 }
 
-// PersistAuthFiles stores the provided auth file changes in PostgreSQL.
+// PersistAuthFiles stores the provided auth file changes in PostgreSQL using
+// batched upserts.
 func (s *PostgresStore) PersistAuthFiles(ctx context.Context, _ string, paths ...string) error {
 	if len(paths) == 0 {
 		return nil
@@ -434,6 +436,8 @@ func (s *PostgresStore) PersistAuthFiles(ctx context.Context, _ string, paths ..
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	var upserts []authRecord
+	var deletes []string
 	for _, p := range paths {
 		trimmed := strings.TrimSpace(p)
 		if trimmed == "" {
@@ -441,7 +445,6 @@ func (s *PostgresStore) PersistAuthFiles(ctx context.Context, _ string, paths ..
 		}
 		relID, err := s.relativeAuthID(trimmed)
 		if err != nil {
-			// Attempt to resolve absolute path under authDir.
 			abs := trimmed
 			if !filepath.IsAbs(abs) {
 				abs = filepath.Join(s.authDir, trimmed)
@@ -453,8 +456,62 @@ func (s *PostgresStore) PersistAuthFiles(ctx context.Context, _ string, paths ..
 			}
 			trimmed = abs
 		}
-		if err = s.syncAuthFile(ctx, relID, trimmed); err != nil {
+		data, errRead := os.ReadFile(trimmed)
+		if errRead != nil {
+			if errors.Is(errRead, fs.ErrNotExist) {
+				deletes = append(deletes, relID)
+			} else {
+				return fmt.Errorf("postgres store: read auth file: %w", errRead)
+			}
+			continue
+		}
+		if len(data) == 0 {
+			deletes = append(deletes, relID)
+			continue
+		}
+		upserts = append(upserts, authRecord{id: relID, data: data})
+	}
+
+	for _, id := range deletes {
+		if err := s.deleteAuthRecord(ctx, id); err != nil {
 			return err
+		}
+	}
+	return s.batchPersistAuth(ctx, upserts)
+}
+
+// authRecord pairs an auth identifier with its serialized content.
+type authRecord struct {
+	id   string
+	data []byte
+}
+
+// batchPersistAuth upserts auth records in batches to stay under PostgreSQL
+// parameter limits.
+func (s *PostgresStore) batchPersistAuth(ctx context.Context, records []authRecord) error {
+	if len(records) == 0 {
+		return nil
+	}
+	tableName := s.fullTableName(s.cfg.AuthTable)
+	for i := 0; i < len(records); i += authBatchSize {
+		end := min(i+authBatchSize, len(records))
+		batch := records[i:end]
+		numCols := 2
+		valueStrings := make([]string, 0, len(batch))
+		args := make([]any, 0, len(batch)*numCols)
+		for idx, r := range batch {
+			base := idx * numCols
+			valueStrings = append(valueStrings, fmt.Sprintf("($%d, $%d, NOW(), NOW())", base+1, base+2))
+			args = append(args, r.id, json.RawMessage(r.data))
+		}
+		query := fmt.Sprintf(`
+			INSERT INTO %s (id, content, created_at, updated_at)
+			VALUES %s
+			ON CONFLICT (id)
+			DO UPDATE SET content = EXCLUDED.content, updated_at = NOW()
+		`, tableName, strings.Join(valueStrings, ", "))
+		if _, err := s.db.ExecContext(ctx, query, args...); err != nil {
+			return fmt.Errorf("postgres store: batch persist auth: %w", err)
 		}
 	}
 	return nil
@@ -557,20 +614,6 @@ func (s *PostgresStore) syncAuthFromDatabase(ctx context.Context) error {
 		return fmt.Errorf("postgres store: iterate auth rows: %w", err)
 	}
 	return nil
-}
-
-func (s *PostgresStore) syncAuthFile(ctx context.Context, relID, path string) error {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return s.deleteAuthRecord(ctx, relID)
-		}
-		return fmt.Errorf("postgres store: read auth file: %w", err)
-	}
-	if len(data) == 0 {
-		return s.deleteAuthRecord(ctx, relID)
-	}
-	return s.persistAuth(ctx, relID, data)
 }
 
 func (s *PostgresStore) upsertAuthRecord(ctx context.Context, relID string, data []byte) error {
