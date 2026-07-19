@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -989,6 +990,12 @@ func ensureEmptyFile(path string) error {
 }
 
 func jsonEqual(a, b []byte) bool {
+	// Fast path: byte-level comparison avoids the cost of full
+	// deserialisation when the two blobs are identical (the common
+	// case when auth content has not changed).
+	if bytes.Equal(a, b) {
+		return true
+	}
 	var objA any
 	var objB any
 	if err := json.Unmarshal(a, &objA); err != nil {
