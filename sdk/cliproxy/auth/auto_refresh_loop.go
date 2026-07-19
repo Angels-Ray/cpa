@@ -231,8 +231,7 @@ func (l *authAutoRefreshLoop) handleDueAuth(ctx context.Context, now time.Time, 
 		manager.mu.RUnlock()
 		return
 	}
-	next, shouldSchedule := nextRefreshCheckAt(now, auth, l.interval)
-	shouldRefresh := manager.shouldRefresh(auth, now)
+	next, shouldSchedule, shouldRefresh := checkRefresh(now, auth, l.interval)
 	exec := manager.executors[auth.Provider]
 	manager.mu.RUnlock()
 
@@ -335,6 +334,90 @@ func (l *authAutoRefreshLoop) remove(authID string) {
 	}
 	heap.Remove(&l.queue, item.index)
 	delete(l.index, authID)
+}
+
+// checkRefresh computes both the next scheduled check time and whether the
+// auth should be refreshed now, using a single pass over the auth data to
+// avoid duplicate parsing of timestamps, intervals and lead times.
+func checkRefresh(now time.Time, auth *Auth, interval time.Duration) (next time.Time, shouldSchedule, shouldRefresh bool) {
+	if auth == nil {
+		return time.Time{}, false, false
+	}
+	if hasUnauthorizedAuthFailure(auth) {
+		return time.Time{}, false, false
+	}
+
+	if auth.AuthKind() == AuthKindAPIKey {
+		return time.Time{}, false, false
+	}
+
+	if !auth.NextRefreshAfter.IsZero() && now.Before(auth.NextRefreshAfter) {
+		return auth.NextRefreshAfter, true, false
+	}
+
+	if evaluator, ok := auth.Runtime.(RefreshEvaluator); ok && evaluator != nil {
+		if interval <= 0 {
+			interval = refreshCheckInterval
+		}
+		return now.Add(interval), true, evaluator.ShouldRefresh(now, auth)
+	}
+
+	// Compute shared values once.
+	lastRefresh := auth.LastRefreshedAt
+	if lastRefresh.IsZero() {
+		if ts, ok := authLastRefreshTimestamp(auth); ok {
+			lastRefresh = ts
+		}
+	}
+
+	expiry, hasExpiry := auth.ExpirationTime()
+
+	if pref := authPreferredInterval(auth); pref > 0 {
+		candidates := make([]time.Time, 0, 2)
+		if hasExpiry && !expiry.IsZero() {
+			if !expiry.After(now) || expiry.Sub(now) <= pref {
+				return now, true, true
+			}
+			candidates = append(candidates, expiry.Add(-pref))
+		}
+		if lastRefresh.IsZero() {
+			return now, true, true
+		}
+		candidates = append(candidates, lastRefresh.Add(pref))
+		nextTime := candidates[0]
+		for _, candidate := range candidates[1:] {
+			if candidate.Before(nextTime) {
+				nextTime = candidate
+			}
+		}
+		if !nextTime.After(now) {
+			return now, true, true
+		}
+		return nextTime, true, now.Sub(lastRefresh) >= pref
+	}
+
+	provider := strings.ToLower(auth.Provider)
+	lead := ProviderRefreshLead(provider, auth.Runtime)
+	if lead == nil {
+		return time.Time{}, false, false
+	}
+
+	shouldRefresh = false
+	if hasExpiry && !expiry.IsZero() {
+		dueAt := expiry.Add(-*lead)
+		if !dueAt.After(now) {
+			return now, true, true
+		}
+		return dueAt, true, time.Until(expiry) <= *lead
+	}
+	if !lastRefresh.IsZero() {
+		dueAt := lastRefresh.Add(*lead)
+		if !dueAt.After(now) {
+			return now, true, true
+		}
+		return dueAt, true, now.Sub(lastRefresh) >= *lead
+	}
+	return now, true, true
 }
 
 func nextRefreshCheckAt(now time.Time, auth *Auth, interval time.Duration) (time.Time, bool) {
