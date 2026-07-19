@@ -43,6 +43,7 @@ type PostgresStore struct {
 	configPath string
 	authDir    string
 	mu         sync.Mutex
+	schemaOnce sync.Once
 }
 
 // NewPostgresStore establishes a connection to PostgreSQL and prepares the local workspace.
@@ -111,11 +112,21 @@ func (s *PostgresStore) Close() error {
 	return s.db.Close()
 }
 
-// EnsureSchema creates the required tables (and schema when provided).
+// EnsureSchema creates the required tables and indexes. The underlying DDL is
+// executed at most once per store instance, regardless of how many times this
+// method is called.
 func (s *PostgresStore) EnsureSchema(ctx context.Context) error {
 	if s == nil || s.db == nil {
 		return fmt.Errorf("postgres store: not initialized")
 	}
+	var err error
+	s.schemaOnce.Do(func() {
+		err = s.ensureSchemaOnce(ctx)
+	})
+	return err
+}
+
+func (s *PostgresStore) ensureSchemaOnce(ctx context.Context) error {
 	if schema := strings.TrimSpace(s.cfg.Schema); schema != "" {
 		query := fmt.Sprintf("CREATE SCHEMA IF NOT EXISTS %s", quoteIdentifier(schema))
 		if _, err := s.db.ExecContext(ctx, query); err != nil {
@@ -143,6 +154,11 @@ func (s *PostgresStore) EnsureSchema(ctx context.Context) error {
 		)
 	`, authTable)); err != nil {
 		return fmt.Errorf("postgres store: create auth table: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, fmt.Sprintf(
+		`CREATE INDEX IF NOT EXISTS idx_auth_updated_at ON %s(updated_at)`, authTable,
+	)); err != nil {
+		return fmt.Errorf("postgres store: create updated_at index: %w", err)
 	}
 	return nil
 }
