@@ -292,6 +292,51 @@ func (s *PostgresStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (stri
 	return path, nil
 }
 
+// scanAuthRow converts a single database row into an Auth value. It returns
+// nil when the row should be skipped (e.g. invalid path or unparseable JSON).
+func (s *PostgresStore) scanAuthRow(id, payload string, createdAt, updatedAt time.Time) *cliproxyauth.Auth {
+	path, errPath := s.absoluteAuthPath(id)
+	if errPath != nil {
+		log.WithError(errPath).Warnf("postgres store: skipping auth %s outside spool", id)
+		return nil
+	}
+	metadata := make(map[string]any)
+	if err := json.Unmarshal([]byte(payload), &metadata); err != nil {
+		log.WithError(err).Warnf("postgres store: skipping auth %s with invalid json", id)
+		return nil
+	}
+	provider := strings.TrimSpace(valueAsString(metadata["type"]))
+	if provider == "" {
+		provider = "unknown"
+	}
+	attr := map[string]string{
+		cliproxyauth.AttributePath:          path,
+		cliproxyauth.AttributeSourceBackend: cliproxyauth.AuthSourcePostgres,
+	}
+	if email := strings.TrimSpace(valueAsString(metadata["email"])); email != "" {
+		attr["email"] = email
+	}
+	auth := &cliproxyauth.Auth{
+		ID:               normalizeAuthID(id),
+		Provider:         provider,
+		FileName:         normalizeAuthID(id),
+		Label:            labelFor(metadata),
+		Status:           cliproxyauth.StatusActive,
+		Attributes:       attr,
+		Metadata:         metadata,
+		CreatedAt:        createdAt,
+		UpdatedAt:        updatedAt,
+		LastRefreshedAt:  time.Time{},
+		NextRefreshAfter: time.Time{},
+	}
+	cliproxyauth.ApplyCustomHeadersFromMetadata(auth)
+	if disabled, ok := metadata["disabled"].(bool); ok && disabled {
+		auth.Disabled = true
+		auth.Status = cliproxyauth.StatusDisabled
+	}
+	return auth
+}
+
 // List enumerates all auth records stored in PostgreSQL.
 func (s *PostgresStore) List(ctx context.Context) ([]*cliproxyauth.Auth, error) {
 	query := fmt.Sprintf("SELECT id, content, created_at, updated_at FROM %s ORDER BY id", s.fullTableName(s.cfg.AuthTable))
@@ -312,46 +357,44 @@ func (s *PostgresStore) List(ctx context.Context) ([]*cliproxyauth.Auth, error) 
 		if err = rows.Scan(&id, &payload, &createdAt, &updatedAt); err != nil {
 			return nil, fmt.Errorf("postgres store: scan auth row: %w", err)
 		}
-		path, errPath := s.absoluteAuthPath(id)
-		if errPath != nil {
-			log.WithError(errPath).Warnf("postgres store: skipping auth %s outside spool", id)
-			continue
+		if a := s.scanAuthRow(id, payload, createdAt, updatedAt); a != nil {
+			auths = append(auths, a)
 		}
-		metadata := make(map[string]any)
-		if err = json.Unmarshal([]byte(payload), &metadata); err != nil {
-			log.WithError(err).Warnf("postgres store: skipping auth %s with invalid json", id)
-			continue
+	}
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("postgres store: iterate auth rows: %w", err)
+	}
+	return auths, nil
+}
+
+// ListSince returns auth records whose updated_at is after the given time.
+// The caller must ensure the idx_auth_updated_at index exists (created during
+// EnsureSchema).
+func (s *PostgresStore) ListSince(ctx context.Context, after time.Time) ([]*cliproxyauth.Auth, error) {
+	query := fmt.Sprintf(
+		"SELECT id, content, created_at, updated_at FROM %s WHERE updated_at > $1 ORDER BY updated_at",
+		s.fullTableName(s.cfg.AuthTable),
+	)
+	rows, err := s.db.QueryContext(ctx, query, after)
+	if err != nil {
+		return nil, fmt.Errorf("postgres store: list auth since: %w", err)
+	}
+	defer rows.Close()
+
+	auths := make([]*cliproxyauth.Auth, 0, 32)
+	for rows.Next() {
+		var (
+			id        string
+			payload   string
+			createdAt time.Time
+			updatedAt time.Time
+		)
+		if err = rows.Scan(&id, &payload, &createdAt, &updatedAt); err != nil {
+			return nil, fmt.Errorf("postgres store: scan auth row: %w", err)
 		}
-		provider := strings.TrimSpace(valueAsString(metadata["type"]))
-		if provider == "" {
-			provider = "unknown"
+		if a := s.scanAuthRow(id, payload, createdAt, updatedAt); a != nil {
+			auths = append(auths, a)
 		}
-		attr := map[string]string{
-			cliproxyauth.AttributePath:          path,
-			cliproxyauth.AttributeSourceBackend: cliproxyauth.AuthSourcePostgres,
-		}
-		if email := strings.TrimSpace(valueAsString(metadata["email"])); email != "" {
-			attr["email"] = email
-		}
-		auth := &cliproxyauth.Auth{
-			ID:               normalizeAuthID(id),
-			Provider:         provider,
-			FileName:         normalizeAuthID(id),
-			Label:            labelFor(metadata),
-			Status:           cliproxyauth.StatusActive,
-			Attributes:       attr,
-			Metadata:         metadata,
-			CreatedAt:        createdAt,
-			UpdatedAt:        updatedAt,
-			LastRefreshedAt:  time.Time{},
-			NextRefreshAfter: time.Time{},
-		}
-		cliproxyauth.ApplyCustomHeadersFromMetadata(auth)
-		if disabled, ok := metadata["disabled"].(bool); ok && disabled {
-			auth.Disabled = true
-			auth.Status = cliproxyauth.StatusDisabled
-		}
-		auths = append(auths, auth)
 	}
 	if err = rows.Err(); err != nil {
 		return nil, fmt.Errorf("postgres store: iterate auth rows: %w", err)
