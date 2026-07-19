@@ -677,24 +677,147 @@ func (m *modelScheduler) upsertEntryLocked(meta *scheduledAuthMeta, now time.Tim
 		entry.nextRetryAt = next
 	}
 
+
 	if ok && previousState == entry.state && previousNextRetryAt.Equal(entry.nextRetryAt) && previousPriority == meta.priority && previousWebsocketEnabled == meta.websocketEnabled {
 		return
 	}
-	m.rebuildIndexesLocked()
+	if ok {
+		m.removeEntryFromIndexesLocked(entry, previousState, previousPriority)
+	}
+	m.addEntryToIndexesLocked(entry)
 }
 
-// removeEntryLocked deletes one auth entry and rebuilds the shard indexes if needed.
+// removeEntryLocked deletes one auth entry and removes it from the active indexes.
 func (m *modelScheduler) removeEntryLocked(authID string) {
 	if m == nil || authID == "" {
 		return
 	}
-	if _, ok := m.entries[authID]; !ok {
+	entry, ok := m.entries[authID]
+	if !ok || entry == nil {
 		return
 	}
+	priority := 0
+	if entry.meta != nil {
+		priority = entry.meta.priority
+	}
+	m.removeEntryFromIndexesLocked(entry, entry.state, priority)
 	delete(m.entries, authID)
-	m.rebuildIndexesLocked()
 }
 
+// removeEntryFromIndexesLocked removes an entry from the ready or blocked index.
+func (m *modelScheduler) removeEntryFromIndexesLocked(entry *scheduledAuth, state scheduledState, priority int) {
+	switch state {
+	case scheduledStateReady:
+		bucket, ok := m.readyByPriority[priority]
+		if !ok || bucket == nil {
+			return
+		}
+		bucket.all.flat = removeFromFlat(bucket.all.flat, entry)
+		if bucket.all.cursor >= len(bucket.all.flat) {
+			bucket.all.cursor = 0
+		}
+		bucket.ws.flat = removeFromFlat(bucket.ws.flat, entry)
+		if bucket.ws.cursor >= len(bucket.ws.flat) {
+			bucket.ws.cursor = 0
+		}
+		if len(bucket.all.flat) == 0 {
+			delete(m.readyByPriority, priority)
+			m.priorityOrder = removeFromIntSlice(m.priorityOrder, priority)
+		}
+	case scheduledStateCooldown, scheduledStateBlocked:
+		for i, e := range m.blocked {
+			if e == entry {
+				m.blocked = append(m.blocked[:i], m.blocked[i+1:]...)
+				break
+			}
+		}
+	}
+}
+
+// addEntryToIndexesLocked adds an entry to the appropriate ready or blocked index.
+func (m *modelScheduler) addEntryToIndexesLocked(entry *scheduledAuth) {
+	switch entry.state {
+	case scheduledStateReady:
+		priority := 0
+		if entry.meta != nil {
+			priority = entry.meta.priority
+		}
+		bucket, ok := m.readyByPriority[priority]
+		if !ok || bucket == nil {
+			bucket = &readyBucket{}
+			m.readyByPriority[priority] = bucket
+			m.priorityOrder = append(m.priorityOrder, priority)
+			sort.Slice(m.priorityOrder, func(i, j int) bool {
+				return m.priorityOrder[i] > m.priorityOrder[j]
+			})
+		}
+		bucket.all.flat = insertIntoSortedFlat(bucket.all.flat, entry)
+		if entry.meta != nil && entry.meta.websocketEnabled {
+			bucket.ws.flat = insertIntoSortedFlat(bucket.ws.flat, entry)
+		}
+	case scheduledStateCooldown, scheduledStateBlocked:
+		m.blocked = insertIntoSortedBlocked(m.blocked, entry)
+	}
+}
+
+// removeFromFlat removes one entry from a flat slice, preserving order.
+func removeFromFlat(flat []*scheduledAuth, entry *scheduledAuth) []*scheduledAuth {
+	for i, e := range flat {
+		if e == entry {
+			return append(flat[:i], flat[i+1:]...)
+		}
+	}
+	return flat
+}
+
+// insertIntoSortedFlat inserts an entry into a flat slice sorted by auth.ID.
+func insertIntoSortedFlat(flat []*scheduledAuth, entry *scheduledAuth) []*scheduledAuth {
+	pos := len(flat)
+	for i, e := range flat {
+		if entry.auth.ID < e.auth.ID {
+			pos = i
+			break
+		}
+	}
+	flat = append(flat, nil)
+	copy(flat[pos+1:], flat[pos:])
+	flat[pos] = entry
+	return flat
+}
+
+// insertIntoSortedBlocked inserts an entry into the blocked slice sorted by nextRetryAt.
+func insertIntoSortedBlocked(blocked []*scheduledAuth, entry *scheduledAuth) []*scheduledAuth {
+	if entry.nextRetryAt.IsZero() {
+		blocked = append(blocked, entry)
+		return blocked
+	}
+	pos := len(blocked)
+	for i, e := range blocked {
+		if e.nextRetryAt.IsZero() {
+			continue
+		}
+		if entry.nextRetryAt.Before(e.nextRetryAt) || (entry.nextRetryAt.Equal(e.nextRetryAt) && entry.auth.ID < e.auth.ID) {
+			pos = i
+			break
+		}
+	}
+	blocked = append(blocked, nil)
+	copy(blocked[pos+1:], blocked[pos:])
+	blocked[pos] = entry
+	return blocked
+}
+
+// removeFromIntSlice removes all occurrences of a value from a slice.
+func removeFromIntSlice(s []int, v int) []int {
+	n := 0
+	for _, x := range s {
+		if x != v {
+			s[n] = x
+			n++
+		}
+	}
+	return s[:n]
+}
 // promoteExpiredLocked reevaluates blocked auths whose retry time has elapsed.
 func (m *modelScheduler) promoteExpiredLocked(now time.Time) {
 	if m == nil || len(m.blocked) == 0 {
