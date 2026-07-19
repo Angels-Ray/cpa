@@ -808,7 +808,7 @@ func (e *XAIExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cl
 		return nil, err
 	}
 	if auth.Metadata == nil {
-		auth.Metadata = make(map[string]any)
+		auth.Metadata = make(map[string]any, 15)
 	}
 	auth.Metadata["type"] = "xai"
 	auth.Metadata["auth_kind"] = "oauth"
@@ -842,7 +842,7 @@ func (e *XAIExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cl
 	}
 	auth.Metadata["last_refresh"] = time.Now().UTC().Format(time.RFC3339)
 	if auth.Attributes == nil {
-		auth.Attributes = make(map[string]string)
+		auth.Attributes = make(map[string]string, 2)
 	}
 	auth.Attributes["auth_kind"] = "oauth"
 	if strings.TrimSpace(auth.Attributes["base_url"]) == "" {
