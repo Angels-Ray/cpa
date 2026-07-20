@@ -574,6 +574,10 @@ func (m *Manager) clearDisabledCooldownStates(cfg *internalconfig.Config) bool {
 		if !quotaCooldownDisabledForAuthWithConfig(auth, cfg) && !auth.Disabled && auth.Status != StatusDisabled {
 			continue
 		}
+		// Skip auths with no cooldown/quota state to clear.
+		if !authHasClearableCooldownState(auth) {
+			continue
+		}
 		if clearCooldownStateForAuth(auth, now) {
 			snapshots = append(snapshots, auth.Clone())
 		}
@@ -586,6 +590,24 @@ func (m *Manager) clearDisabledCooldownStates(cfg *internalconfig.Config) bool {
 		}
 	}
 	return len(snapshots) > 0
+}
+
+func authHasClearableCooldownState(auth *Auth) bool {
+	if auth == nil {
+		return false
+	}
+	if auth.Unavailable || !auth.NextRetryAfter.IsZero() || auth.Quota.Exceeded || !auth.Quota.NextRecoverAt.IsZero() {
+		return true
+	}
+	for _, state := range auth.ModelStates {
+		if state == nil {
+			continue
+		}
+		if state.Unavailable || !state.NextRetryAfter.IsZero() || state.Quota.Exceeded || !state.Quota.NextRecoverAt.IsZero() {
+			return true
+		}
+	}
+	return false
 }
 
 // RestoreCooldownStates restores unexpired persisted cooldown records into registered auths.
@@ -2259,6 +2281,11 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	auth.EnsureIndex()
 	authClone := auth.Clone()
 	m.mu.Lock()
+	// Register replaces any existing entry with the same ID (callers that need
+	// merge semantics should use Update). Drop the old index entry first.
+	if existing := m.auths[auth.ID]; existing != nil {
+		m.removeAuthFromProviderIndexLocked(existing)
+	}
 	m.auths[auth.ID] = authClone
 	m.addAuthToProviderIndexLocked(authClone)
 	m.mu.Unlock()
@@ -5101,19 +5128,24 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 	}
 	if strings.TrimSpace(model) != "" {
 		m.mu.RLock()
-		for _, candidate := range m.authsByProvider[provider] {
+		needLegacy := false
+		m.forAuthsOfProvidersLocked([]string{provider}, func(candidate *Auth) bool {
 			if candidate == nil || candidate.Disabled {
-				continue
+				return false
 			}
 			if _, used := tried[candidate.ID]; used {
-				continue
+				return false
 			}
 			if m.routeAwareSelectionRequired(candidate, model) {
-				m.mu.RUnlock()
-				return m.pickNextLegacy(ctx, provider, model, opts, tried)
+				needLegacy = true
+				return true
 			}
-		}
+			return false
+		})
 		m.mu.RUnlock()
+		if needLegacy {
+			return m.pickNextLegacy(ctx, provider, model, opts, tried)
+		}
 	}
 	executor, okExecutor := m.Executor(provider)
 	if !okExecutor {
@@ -5287,21 +5319,28 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 			providerSet[providerKey] = struct{}{}
 		}
 		m.mu.RLock()
+		needLegacy := false
+		providerKeys := make([]string, 0, len(providerSet))
 		for providerKey := range providerSet {
-			for _, candidate := range m.authsByProvider[providerKey] {
-				if candidate == nil || candidate.Disabled {
-					continue
-				}
-				if _, used := tried[candidate.ID]; used {
-					continue
-				}
-				if m.routeAwareSelectionRequired(candidate, model) {
-					m.mu.RUnlock()
-					return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
-				}
-			}
+			providerKeys = append(providerKeys, providerKey)
 		}
+		m.forAuthsOfProvidersLocked(providerKeys, func(candidate *Auth) bool {
+			if candidate == nil || candidate.Disabled {
+				return false
+			}
+			if _, used := tried[candidate.ID]; used {
+				return false
+			}
+			if m.routeAwareSelectionRequired(candidate, model) {
+				needLegacy = true
+				return true
+			}
+			return false
+		})
 		m.mu.RUnlock()
+		if needLegacy {
+			return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
+		}
 	}
 
 	disallowFreeAuth := disallowFreeAuthFromMetadata(opts.Metadata)

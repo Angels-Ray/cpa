@@ -923,7 +923,7 @@ func (m *modelScheduler) highestReadyPriorityLocked(preferWebsocket bool, predic
 			if bucket == nil {
 				continue
 			}
-			if bucket.ws.pickFirst(predicate) != nil {
+			if readyViewHasMatch(&bucket.ws, predicate) {
 				return priority, true
 			}
 		}
@@ -933,7 +933,7 @@ func (m *modelScheduler) highestReadyPriorityLocked(preferWebsocket bool, predic
 		if bucket == nil {
 			continue
 		}
-		if bucket.all.pickFirst(predicate) != nil {
+		if readyViewHasMatch(&bucket.all, predicate) {
 			return priority, true
 		}
 	}
@@ -951,7 +951,9 @@ func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priorit
 		return nil
 	}
 	view := &bucket.all
-	if preferWebsocket && bucket.ws.pickFirst(predicate) != nil {
+	// Prefer websocket view when it has any matching ready entry. Use len-based
+	// existence when predicate is nil to avoid a redundant full scan.
+	if preferWebsocket && readyViewHasMatch(&bucket.ws, predicate) {
 		view = &bucket.ws
 	}
 	var picked *scheduledAuth
@@ -964,6 +966,18 @@ func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priorit
 		return nil
 	}
 	return picked.auth
+}
+
+// readyViewHasMatch reports whether the view has any entry matching predicate.
+// When predicate is nil, a non-empty flat list is sufficient (O(1)).
+func readyViewHasMatch(view *readyView, predicate func(*scheduledAuth) bool) bool {
+	if view == nil || len(view.flat) == 0 {
+		return false
+	}
+	if predicate == nil {
+		return true
+	}
+	return view.pickFirst(predicate) != nil
 }
 
 func (m *modelScheduler) readyCountAtPriorityLocked(preferWebsocket bool, priority int) int {
