@@ -819,37 +819,80 @@ func removeFromIntSlice(s []int, v int) []int {
 	return s[:n]
 }
 // promoteExpiredLocked reevaluates blocked auths whose retry time has elapsed.
+// blocked is ordered by nextRetryAt (zero times last), so only a prefix of due
+// entries is scanned. Index updates are incremental unless a large batch is
+// promoted, in which case a full rebuild is cheaper than many splices.
 func (m *modelScheduler) promoteExpiredLocked(now time.Time) {
 	if m == nil || len(m.blocked) == 0 {
 		return
 	}
-	changed := false
+
+	const promoteRebuildThreshold = 64
+	type promotion struct {
+		entry         *scheduledAuth
+		previousState scheduledState
+		newState      scheduledState
+		nextRetryAt   time.Time
+	}
+	var promotions []promotion
+
 	for _, entry := range m.blocked {
 		if entry == nil || entry.auth == nil {
 			continue
 		}
+		// blocked is ordered by nextRetryAt ascending with zero times last.
+		// Stop once we pass all currently due entries.
 		if entry.nextRetryAt.IsZero() || entry.nextRetryAt.After(now) {
-			continue
+			break
 		}
+		previousState := entry.state
 		blocked, reason, next := isAuthBlockedForModel(entry.auth, m.modelKey, now)
+		var newState scheduledState
+		var nextRetryAt time.Time
 		switch {
 		case !blocked:
-			entry.state = scheduledStateReady
-			entry.nextRetryAt = time.Time{}
+			newState = scheduledStateReady
 		case reason == blockReasonCooldown:
-			entry.state = scheduledStateCooldown
-			entry.nextRetryAt = next
+			newState = scheduledStateCooldown
+			nextRetryAt = next
 		case reason == blockReasonDisabled:
-			entry.state = scheduledStateDisabled
-			entry.nextRetryAt = time.Time{}
+			newState = scheduledStateDisabled
 		default:
-			entry.state = scheduledStateBlocked
-			entry.nextRetryAt = next
+			newState = scheduledStateBlocked
+			nextRetryAt = next
 		}
-		changed = true
+		if newState == previousState && nextRetryAt.Equal(entry.nextRetryAt) {
+			continue
+		}
+		promotions = append(promotions, promotion{
+			entry:         entry,
+			previousState: previousState,
+			newState:      newState,
+			nextRetryAt:   nextRetryAt,
+		})
 	}
-	if changed {
+	if len(promotions) == 0 {
+		return
+	}
+
+	if len(promotions) > promoteRebuildThreshold {
+		for _, p := range promotions {
+			p.entry.state = p.newState
+			p.entry.nextRetryAt = p.nextRetryAt
+		}
 		m.rebuildIndexesLocked()
+		return
+	}
+
+	for _, p := range promotions {
+		priority := 0
+		if p.entry.meta != nil {
+			priority = p.entry.meta.priority
+		}
+		m.removeEntryFromIndexesLocked(p.entry, p.previousState, priority)
+		p.entry.state = p.newState
+		p.entry.nextRetryAt = p.nextRetryAt
+		m.addEntryToIndexesLocked(p.entry)
 	}
 }
 
