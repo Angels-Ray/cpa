@@ -348,18 +348,13 @@ func (h *Handler) GetAuthFileModels(c *gin.Context) {
 		return
 	}
 
-	// Try to find auth ID via authManager
+	// Try to find auth ID via authManager without listing every auth.
 	var authID string
 	if h.authManager != nil {
-		auths := h.authManager.List()
-		for _, auth := range auths {
-			if auth.FileName == name || auth.ID == name {
-				authID = auth.ID
-				break
-			}
+		if auth := h.findAuthByNameOrID(name); auth != nil {
+			authID = auth.ID
 		}
 	}
-
 	if authID == "" {
 		authID = name // fallback to filename as ID
 	}
@@ -1073,7 +1068,9 @@ func isPluginVirtualSourceDelete(name string, auth *coreauth.Auth) bool {
 	return strings.EqualFold(filepath.Base(strings.TrimSpace(name)), filepath.Base(sourcePath))
 }
 
-func (h *Handler) findAuthForDelete(name string) *coreauth.Auth {
+// findAuthByNameOrID resolves an auth by ID first, then by FileName/path basename.
+// Used by single-auth management endpoints to avoid a full List() on every call.
+func (h *Handler) findAuthByNameOrID(name string) *coreauth.Auth {
 	if h == nil || h.authManager == nil {
 		return nil
 	}
@@ -1097,6 +1094,10 @@ func (h *Handler) findAuthForDelete(name string) *coreauth.Auth {
 		}
 	}
 	return nil
+}
+
+func (h *Handler) findAuthForDelete(name string) *coreauth.Auth {
+	return h.findAuthByNameOrID(name)
 }
 
 func (h *Handler) authIDForPath(path string) string {
@@ -1262,20 +1263,7 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 
 	ctx := c.Request.Context()
 
-	// Find auth by name or ID
-	var targetAuth *coreauth.Auth
-	if auth, ok := h.authManager.GetByID(name); ok {
-		targetAuth = auth
-	} else {
-		auths := h.authManager.List()
-		for _, auth := range auths {
-			if auth.FileName == name {
-				targetAuth = auth
-				break
-			}
-		}
-	}
-
+	targetAuth := h.findAuthByNameOrID(name)
 	if targetAuth == nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
 		return
@@ -1458,20 +1446,7 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 
 	ctx := c.Request.Context()
 
-	// Find auth by name or ID
-	var targetAuth *coreauth.Auth
-	if auth, ok := h.authManager.GetByID(name); ok {
-		targetAuth = auth
-	} else {
-		auths := h.authManager.List()
-		for _, auth := range auths {
-			if auth.FileName == name {
-				targetAuth = auth
-				break
-			}
-		}
-	}
-
+	targetAuth := h.findAuthByNameOrID(name)
 	if targetAuth == nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
 		return
