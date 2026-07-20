@@ -3546,13 +3546,9 @@ func (m *Manager) closestCooldownWait(providers []string, model string, attempt 
 	if defaultRetry < 0 {
 		defaultRetry = 0
 	}
-	providerSet := make(map[string]struct{}, len(providers))
-	for i := range providers {
-		key := strings.TrimSpace(strings.ToLower(providers[i]))
-		if key == "" {
-			continue
-		}
-		providerSet[key] = struct{}{}
+	providerKeys := normalizeProviderKeys(providers)
+	if len(providerKeys) == 0 {
+		return 0, false
 	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -3560,14 +3556,7 @@ func (m *Manager) closestCooldownWait(providers []string, model string, attempt 
 		found   bool
 		minWait time.Duration
 	)
-	for _, auth := range m.auths {
-		if auth == nil {
-			continue
-		}
-		providerKey := executorKeyFromAuth(auth)
-		if _, ok := providerSet[providerKey]; !ok {
-			continue
-		}
+	m.forAuthsOfProvidersLocked(providerKeys, func(auth *Auth) bool {
 		effectiveRetry := defaultRetry
 		if override, ok := auth.RequestRetryOverride(); ok {
 			effectiveRetry = override
@@ -3576,7 +3565,7 @@ func (m *Manager) closestCooldownWait(providers []string, model string, attempt 
 			effectiveRetry = 0
 		}
 		if attempt >= effectiveRetry {
-			continue
+			return false
 		}
 		checkModel := model
 		if strings.TrimSpace(model) != "" {
@@ -3584,17 +3573,18 @@ func (m *Manager) closestCooldownWait(providers []string, model string, attempt 
 		}
 		blocked, reason, next := isAuthBlockedForModel(auth, checkModel, now)
 		if !blocked || next.IsZero() || reason == blockReasonDisabled {
-			continue
+			return false
 		}
 		wait := next.Sub(now)
 		if wait < 0 {
-			continue
+			return false
 		}
 		if !found || wait < minWait {
 			minWait = wait
 			found = true
 		}
-	}
+		return false
+	})
 	return minWait, found
 }
 
@@ -3606,28 +3596,15 @@ func (m *Manager) retryAllowed(attempt int, providers []string) bool {
 	if defaultRetry < 0 {
 		defaultRetry = 0
 	}
-	providerSet := make(map[string]struct{}, len(providers))
-	for i := range providers {
-		key := strings.TrimSpace(strings.ToLower(providers[i]))
-		if key == "" {
-			continue
-		}
-		providerSet[key] = struct{}{}
-	}
-	if len(providerSet) == 0 {
+	providerKeys := normalizeProviderKeys(providers)
+	if len(providerKeys) == 0 {
 		return false
 	}
 
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	for _, auth := range m.auths {
-		if auth == nil {
-			continue
-		}
-		providerKey := executorKeyFromAuth(auth)
-		if _, ok := providerSet[providerKey]; !ok {
-			continue
-		}
+	allowed := false
+	m.forAuthsOfProvidersLocked(providerKeys, func(auth *Auth) bool {
 		effectiveRetry := defaultRetry
 		if override, ok := auth.RequestRetryOverride(); ok {
 			effectiveRetry = override
@@ -3636,10 +3613,12 @@ func (m *Manager) retryAllowed(attempt int, providers []string) bool {
 			effectiveRetry = 0
 		}
 		if attempt < effectiveRetry {
+			allowed = true
 			return true
 		}
-	}
-	return false
+		return false
+	})
+	return allowed
 }
 
 func (m *Manager) shouldRetryAfterError(err error, attempt int, providers []string, model string, maxWait time.Duration) (time.Duration, bool) {
@@ -6330,6 +6309,39 @@ type RoundTripperProvider interface {
 // to mutate outbound HTTP requests with provider credentials.
 type RequestPreparer interface {
 	PrepareRequest(req *http.Request, auth *Auth) error
+}
+
+// forAuthsOfProvidersLocked visits auths for the given provider keys using the
+// provider index. When an index bucket is empty but m.auths is populated
+// (tests that write m.auths directly), it falls back to scanning m.auths for
+// that key. fn returning true stops iteration. Must be called with m.mu held.
+func (m *Manager) forAuthsOfProvidersLocked(providerKeys []string, fn func(*Auth) bool) {
+	if m == nil || fn == nil || len(providerKeys) == 0 {
+		return
+	}
+	for _, key := range providerKeys {
+		bucket := m.authsByProvider[key]
+		useFallback := len(bucket) == 0 && len(m.auths) > 0
+		if useFallback {
+			for _, auth := range m.auths {
+				if auth == nil || executorKeyFromAuth(auth) != key {
+					continue
+				}
+				if fn(auth) {
+					return
+				}
+			}
+			continue
+		}
+		for _, auth := range bucket {
+			if auth == nil {
+				continue
+			}
+			if fn(auth) {
+				return
+			}
+		}
+	}
 }
 
 // addAuthToProviderIndexLocked inserts an auth into the provider-keyed index.
