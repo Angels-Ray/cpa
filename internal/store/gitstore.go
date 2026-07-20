@@ -20,8 +20,8 @@ import (
 	"github.com/go-git/go-git/v6/plumbing/object"
 	"github.com/go-git/go-git/v6/plumbing/transport"
 	"github.com/go-git/go-git/v6/plumbing/transport/http"
-	appconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"gopkg.in/yaml.v3"
 )
 
 // gcInterval defines minimum time between garbage collection runs.
@@ -1090,6 +1090,8 @@ func (s *GitTokenStore) PersistConfig(_ context.Context) error {
 
 // validateGitConfigFile rejects empty or unparseable config.yaml files.
 // Missing files return fs.ErrNotExist so callers can no-op.
+// Parsing is side-effect free: it must not call LoadConfigOptional, which can
+// rewrite plaintext remote-management keys during validation.
 func validateGitConfigFile(configPath string) error {
 	data, err := os.ReadFile(configPath)
 	if err != nil {
@@ -1101,8 +1103,12 @@ func validateGitConfigFile(configPath string) error {
 	if len(bytes.TrimSpace(data)) == 0 {
 		return fmt.Errorf("git token store: refuse to push empty config file %s", configPath)
 	}
-	if _, err = appconfig.LoadConfigOptional(configPath, false); err != nil {
+	var root map[string]any
+	if err = yaml.Unmarshal(data, &root); err != nil {
 		return fmt.Errorf("git token store: refuse to push invalid config %s: %w", configPath, err)
+	}
+	if root == nil {
+		return fmt.Errorf("git token store: refuse to push empty config document %s", configPath)
 	}
 	return nil
 }
@@ -1126,7 +1132,7 @@ func (s *GitTokenStore) markDirtyLocked(message string, relPaths ...string) {
 
 // scheduleCommitLocked records paths for commit/push according to syncMode.
 // In sync mode it flushes immediately and returns any commit/push error.
-// In export mode it only marks dirty (Flush / PersistAuthFiles / PersistConfig flush later).
+// In export mode it only marks dirty; Flush, PersistAuthFiles, and PersistConfig flush explicitly.
 // Caller must hold s.mu.
 func (s *GitTokenStore) scheduleCommitLocked(message string, relPaths ...string) error {
 	s.markDirtyLocked(message, relPaths...)

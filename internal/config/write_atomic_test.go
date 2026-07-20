@@ -24,3 +24,15 @@ func TestWriteFileAtomicReplacesWithoutEmptyWindow(t *testing.T) {
 		t.Fatalf("got %q want %q", got, payload)
 	}
 }
+
+func TestValidateConfigYAML(t *testing.T) {
+	if err := ValidateConfigYAML([]byte("")); err == nil {
+		t.Fatal("expected empty to fail")
+	}
+	if err := ValidateConfigYAML([]byte(": :\n")); err == nil {
+		t.Fatal("expected broken yaml to fail")
+	}
+	if err := ValidateConfigYAML([]byte("port: 8317\n")); err != nil {
+		t.Fatalf("valid yaml failed: %v", err)
+	}
+}

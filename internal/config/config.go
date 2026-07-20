@@ -721,6 +721,20 @@ func LoadConfig(configFile string) (*Config, error) {
 	return LoadConfigOptional(configFile, false)
 }
 
+// ValidateConfigYAML checks that data is non-empty, parseable YAML that unmarshals
+// into Config. It has no filesystem side effects (unlike LoadConfigOptional, which
+// may rewrite plaintext remote-management secret keys).
+func ValidateConfigYAML(data []byte) error {
+	if len(bytes.TrimSpace(data)) == 0 {
+		return fmt.Errorf("config is empty")
+	}
+	var cfg Config
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return fmt.Errorf("failed to parse config: %w", err)
+	}
+	return nil
+}
+
 // LoadConfigOptional reads YAML from configFile.
 // If optional is true and the file is missing, it returns an empty Config.
 // If optional is true and the file is empty or invalid, it returns an empty Config.

@@ -787,3 +787,22 @@ func TestValidateGitConfigFile(t *testing.T) {
 		t.Fatalf("valid config refused: %v", err)
 	}
 }
+
+func TestValidateGitConfigFileDoesNotRewriteSecretKey(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	original := []byte("port: 8317\nremote-management:\n  secret-key: plaintext-secret\n")
+	if err := os.WriteFile(path, original, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateGitConfigFile(path); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(original) {
+		t.Fatalf("validation rewrote config file\ngot:\n%s\nwant:\n%s", got, original)
+	}
+}
