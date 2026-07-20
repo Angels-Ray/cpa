@@ -2,6 +2,19 @@
 
 [English](README.md) | 中文 | [日本語](README_JA.md)
 
+### 本 fork（`Angels-Ray/cpa`）
+
+- `scripts/cpa-fork-release.sh`：本机用。推当前分支、打日期 tag（当天首发 `vYYYY.MM.DD`，同日再发 `vYYYY.MM.DD.1` / `.2` …），触发 Actions `release`，产出多平台二进制。
+- `scripts/cpa-fork-installer.sh`：服务器用。从本 fork 的 GitHub Release 拉最新（或指定）包，装到 `~/cliproxyapi` 并支持升级（对齐官方 installer 布局）。
+
+```bash
+# 本机发版
+./scripts/cpa-fork-release.sh --wait
+
+# 服务器安装 / 升级
+curl -fsSL https://raw.githubusercontent.com/Angels-Ray/cpa/main/scripts/cpa-fork-installer.sh | bash
+```
+
 一个为 CLI 提供 OpenAI/Gemini/Claude/Codex/Grok 兼容 API 接口的代理服务器。
 
 您可以通过任何与 OpenAI（包括 Responses）、Gemini（包括 Interactions）或 Claude 兼容的客户端或 SDK，以本地方式或多 CLI 账户访问以下提供商。

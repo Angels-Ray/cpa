@@ -2,6 +2,19 @@
 
 English | [中文](README_CN.md) | [日本語](README_JA.md)
 
+### This fork (`Angels-Ray/cpa`)
+
+- `scripts/cpa-fork-release.sh` — local helper: push current branch, create date tag `vYYYY.MM.DD` (same day: `.1`, `.2`, …), trigger GitHub Actions `release` (multi-platform binaries).
+- `scripts/cpa-fork-installer.sh` — server helper: download latest (or pinned) Release asset into `~/cliproxyapi` and install/upgrade (like the official installer).
+
+```bash
+# Local: release
+./scripts/cpa-fork-release.sh --wait
+
+# Server: install / upgrade
+curl -fsSL https://raw.githubusercontent.com/Angels-Ray/cpa/main/scripts/cpa-fork-installer.sh | bash
+```
+
 A proxy server that provides OpenAI/Gemini/Claude/Codex/Grok compatible API interfaces for CLI.
 
 You can access the following providers locally and with multiple CLI accounts through any OpenAI (including Responses), Gemini (including Interactions), or Claude-compatible client or SDK.
