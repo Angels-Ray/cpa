@@ -26,14 +26,31 @@ import (
 // gcInterval defines minimum time between garbage collection runs.
 const gcInterval = 5 * time.Minute
 
-// gitFlushInterval is how long dirty auth/config paths wait before a batched
-// commit+push. Short enough for operational visibility, long enough to coalesce
-// OAuth refresh storms into a single push.
-const gitFlushInterval = 2 * time.Second
+// GitSyncMode controls when local auth changes are committed and pushed.
+type GitSyncMode string
+
+const (
+	// GitSyncSync commits and force-pushes when Save/Delete flush dirty paths.
+	// High-frequency file events are coalesced by the watcher debounce, not git timers.
+	GitSyncSync GitSyncMode = "sync"
+	// GitSyncExport only writes local files on Save/Delete; commit+push happen on
+	// Flush. PersistAuthFiles still flushes so watcher-driven updates reach remote.
+	GitSyncExport GitSyncMode = "export"
+)
+
+// ParseGitSyncMode normalizes a configured sync mode string.
+// Unknown or empty values default to export. Explicit sync/immediate/legacy select sync.
+func ParseGitSyncMode(raw string) GitSyncMode {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case string(GitSyncSync), "immediate", "legacy":
+		return GitSyncSync
+	default:
+		return GitSyncExport
+	}
+}
 
 // GitTokenStore persists token records and auth metadata using git as the backing storage.
-// Local auth files are written synchronously; commit+push is coalesced asynchronously
-// so high-churn token refreshes do not each force a remote push.
+// Local auth files are always written synchronously; remote push behavior depends on syncMode.
 type GitTokenStore struct {
 	mu        sync.Mutex
 	dirLock   sync.RWMutex
@@ -44,14 +61,13 @@ type GitTokenStore struct {
 	branch    string
 	username  string
 	password  string
+	syncMode  GitSyncMode
 	lastGC    time.Time
 
-	// dirtyRelPaths holds repository-relative paths waiting for a batched push.
+	// dirtyRelPaths holds repository-relative paths waiting for a commit+push.
 	dirtyRelPaths map[string]struct{}
 	// pendingMessage is the commit message for the next flush (last writer wins for text).
 	pendingMessage string
-	// flushTimer triggers a batched commit+push of dirty paths.
-	flushTimer *time.Timer
 	// repoReady is set after the first successful EnsureRepository; subsequent
 	// Save/List/Delete skip network pull when the local repo is already prepared.
 	repoReady bool
@@ -69,13 +85,52 @@ type resolvedRemoteBranch struct {
 // TokenStorage implementation embedded in the token record.
 // When branch is non-empty, clone/pull/push operations target that branch instead of the remote default.
 func NewGitTokenStore(remote, username, password, branch string) *GitTokenStore {
+	return NewGitTokenStoreWithMode(remote, username, password, branch, GitSyncExport)
+}
+
+// NewGitTokenStoreWithMode creates a GitTokenStore with an explicit sync mode.
+func NewGitTokenStoreWithMode(remote, username, password, branch string, mode GitSyncMode) *GitTokenStore {
+	if mode == "" {
+		mode = GitSyncExport
+	}
 	return &GitTokenStore{
 		remote:        remote,
 		branch:        strings.TrimSpace(branch),
 		username:      username,
 		password:      password,
+		syncMode:      ParseGitSyncMode(string(mode)),
 		dirtyRelPaths: make(map[string]struct{}),
 	}
+}
+
+// SetSyncMode updates the store sync mode at runtime.
+func (s *GitTokenStore) SetSyncMode(mode GitSyncMode) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.syncMode = ParseGitSyncMode(string(mode))
+}
+
+// SyncMode returns the configured sync mode.
+func (s *GitTokenStore) SyncMode() GitSyncMode {
+	if s == nil {
+		return GitSyncExport
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.syncMode == "" {
+		return GitSyncExport
+	}
+	return s.syncMode
+}
+
+// CoalesceAuthPersist tells the file watcher to merge rapid PersistAuthFiles
+// calls. Git force-push benefits from coalescing; Postgres/object stores do not
+// implement this method and keep immediate durability.
+func (s *GitTokenStore) CoalesceAuthPersist() bool {
+	return s != nil
 }
 
 // SetBaseDir updates the default directory used for auth JSON persistence when no explicit path is provided.
@@ -380,7 +435,9 @@ func (s *GitTokenStore) Save(_ context.Context, auth *cliproxyauth.Auth) (string
 	if strings.TrimSpace(messageID) == "" {
 		messageID = filepath.Base(path)
 	}
-	s.scheduleCommitLocked(fmt.Sprintf("Update auth %s", strings.TrimSpace(messageID)), relPath)
+	if errCommit := s.scheduleCommitLocked(fmt.Sprintf("Update auth %s", strings.TrimSpace(messageID)), relPath); errCommit != nil {
+		return "", errCommit
+	}
 
 	return path, nil
 }
@@ -445,7 +502,9 @@ func (s *GitTokenStore) Delete(_ context.Context, id string) error {
 		if errRel != nil {
 			return errRel
 		}
-		s.scheduleCommitLocked(fmt.Sprintf("Delete auth %s", id), rel)
+		if errCommit := s.scheduleCommitLocked(fmt.Sprintf("Delete auth %s", id), rel); errCommit != nil {
+			return errCommit
+		}
 	}
 	return nil
 }
@@ -482,13 +541,10 @@ func (s *GitTokenStore) PersistAuthFiles(_ context.Context, message string, path
 	if strings.TrimSpace(message) == "" {
 		message = "Sync watcher updates"
 	}
-	// Explicit persist coalesces pending dirty paths into one push.
-	for _, rel := range filtered {
-		s.dirtyRelPaths[rel] = struct{}{}
-	}
-	if s.pendingMessage == "" {
-		s.pendingMessage = message
-	}
+	// Coalesce with any pending dirty paths from Save/Delete, then always flush once.
+	// Watcher already debounces calls; this is the explicit sync boundary for both modes.
+	// scheduleCommitLocked may no-op flush in export mode, so flush explicitly here.
+	s.markDirtyLocked(message, filtered...)
 	return s.flushDirtyLocked()
 }
 
@@ -935,6 +991,7 @@ func (s *GitTokenStore) commitAndPushLocked(message string, relPaths ...string) 
 	}
 	if err = repo.Push(pushOpts); err != nil {
 		if errors.Is(err, git.NoErrAlreadyUpToDate) {
+			s.maybeRunGC(repoDir)
 			return nil
 		}
 		return fmt.Errorf("git token store: push: %w", err)
@@ -1024,13 +1081,12 @@ func (s *GitTokenStore) PersistConfig(_ context.Context) error {
 	if err != nil {
 		return err
 	}
-	s.scheduleCommitLocked("Update config", rel)
-	return nil
+	s.markDirtyLocked("Update config", rel)
+	return s.flushDirtyLocked()
 }
 
-// scheduleCommitLocked records paths for a batched async commit+push.
-// Caller must hold s.mu.
-func (s *GitTokenStore) scheduleCommitLocked(message string, relPaths ...string) {
+// markDirtyLocked records paths and optional commit message. Caller must hold s.mu.
+func (s *GitTokenStore) markDirtyLocked(message string, relPaths ...string) {
 	if s.dirtyRelPaths == nil {
 		s.dirtyRelPaths = make(map[string]struct{})
 	}
@@ -1044,15 +1100,18 @@ func (s *GitTokenStore) scheduleCommitLocked(message string, relPaths ...string)
 	if strings.TrimSpace(message) != "" {
 		s.pendingMessage = message
 	}
-	if s.flushTimer != nil {
-		return
+}
+
+// scheduleCommitLocked records paths for commit/push according to syncMode.
+// In sync mode it flushes immediately and returns any commit/push error.
+// In export mode it only marks dirty (Flush / PersistAuthFiles / PersistConfig flush later).
+// Caller must hold s.mu.
+func (s *GitTokenStore) scheduleCommitLocked(message string, relPaths ...string) error {
+	s.markDirtyLocked(message, relPaths...)
+	if s.syncMode == GitSyncExport {
+		return nil
 	}
-	s.flushTimer = time.AfterFunc(gitFlushInterval, func() {
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		s.flushTimer = nil
-		_ = s.flushDirtyLocked()
-	})
+	return s.flushDirtyLocked()
 }
 
 // Flush commits and pushes any pending dirty paths. Safe to call multiple times.
@@ -1061,10 +1120,6 @@ func (s *GitTokenStore) Flush() error {
 		return nil
 	}
 	s.mu.Lock()
-	if s.flushTimer != nil {
-		s.flushTimer.Stop()
-		s.flushTimer = nil
-	}
 	err := s.flushDirtyLocked()
 	s.mu.Unlock()
 	// Wait for any GC scheduled by the flush push so callers (and tests) can
@@ -1075,10 +1130,6 @@ func (s *GitTokenStore) Flush() error {
 
 // flushDirtyLocked commits all dirty paths in one push. Caller must hold s.mu.
 func (s *GitTokenStore) flushDirtyLocked() error {
-	if s.flushTimer != nil {
-		s.flushTimer.Stop()
-		s.flushTimer = nil
-	}
 	if len(s.dirtyRelPaths) == 0 {
 		return nil
 	}

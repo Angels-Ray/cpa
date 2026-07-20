@@ -128,6 +128,8 @@ func TestEnsureRepositoryInitializesEmptyRemoteUsingConfiguredBranch(t *testing.
 	if err := store.EnsureRepository(); err != nil {
 		t.Fatalf("EnsureRepository: %v", err)
 	}
+	// Wait for async GC started by init commit/push before TempDir cleanup.
+	_ = store.Flush()
 
 	assertRepositoryHeadBranch(t, filepath.Join(root, "workspace"), branch)
 	assertRemoteBranchExistsWithCommit(t, remoteDir, branch)
@@ -629,14 +631,14 @@ func assertRemoteBranchContents(t *testing.T, remoteDir, branch, wantContents st
 	}
 }
 
-func TestGitTokenStoreSaveBatchesPushUntilFlush(t *testing.T) {
+func TestGitTokenStoreSyncModePushesOnSave(t *testing.T) {
 	root := t.TempDir()
 	remoteDir := setupGitRemoteRepository(t, root, "master",
 		testBranchSpec{name: "master", contents: "remote master branch\n"},
 	)
 
 	baseDir := filepath.Join(root, "workspace", "auths")
-	store := NewGitTokenStore(remoteDir, "", "", "master")
+	store := NewGitTokenStoreWithMode(remoteDir, "", "", "master", GitSyncSync)
 	store.SetBaseDir(baseDir)
 	if err := store.EnsureRepository(); err != nil {
 		t.Fatalf("EnsureRepository: %v", err)
@@ -660,17 +662,12 @@ func TestGitTokenStoreSaveBatchesPushUntilFlush(t *testing.T) {
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("local auth file missing: %v", err)
 	}
-
-	// Before Flush, remote should not yet contain the auth file.
-	if remoteHasAuthFile(t, remoteDir, "master", "auths/acct-1.json") {
-		t.Fatal("remote already has auth file before Flush")
+	if !remoteHasAuthFile(t, remoteDir, "master", "auths/acct-1.json") {
+		t.Fatal("sync mode missing remote file after Save")
 	}
-
+	// Wait for async GC so TempDir cleanup is not raced.
 	if err := store.Flush(); err != nil {
 		t.Fatalf("Flush: %v", err)
-	}
-	if !remoteHasAuthFile(t, remoteDir, "master", "auths/acct-1.json") {
-		t.Fatal("remote missing auth file after Flush")
 	}
 }
 
@@ -706,4 +703,54 @@ func remoteHasAuthFile(t *testing.T, remoteDir, branch, relPath string) bool {
 	}
 	_, err = tree.File(relPath)
 	return err == nil
+}
+
+func TestParseGitSyncMode(t *testing.T) {
+	cases := map[string]GitSyncMode{
+		"":          GitSyncExport,
+		"export":    GitSyncExport,
+		"manual":    GitSyncExport,
+		"async":     GitSyncExport,
+		"local":     GitSyncExport,
+		"weird":     GitSyncExport,
+		"sync":      GitSyncSync,
+		"immediate": GitSyncSync,
+		"legacy":    GitSyncSync,
+	}
+	for raw, want := range cases {
+		if got := ParseGitSyncMode(raw); got != want {
+			t.Fatalf("ParseGitSyncMode(%q)=%q, want %q", raw, got, want)
+		}
+	}
+}
+
+func TestGitTokenStoreExportModeDefersPushUntilFlush(t *testing.T) {
+	root := t.TempDir()
+	remoteDir := setupGitRemoteRepository(t, root, "master",
+		testBranchSpec{name: "master", contents: "remote master branch\n"},
+	)
+	baseDir := filepath.Join(root, "workspace", "auths")
+	store := NewGitTokenStoreWithMode(remoteDir, "", "", "master", GitSyncExport)
+	store.SetBaseDir(baseDir)
+	if err := store.EnsureRepository(); err != nil {
+		t.Fatalf("EnsureRepository: %v", err)
+	}
+	auth := &cliproxyauth.Auth{
+		ID:       "export-only.json",
+		Provider: "xai",
+		FileName: "export-only.json",
+		Metadata: map[string]any{"type": "xai", "access_token": "t"},
+	}
+	if _, err := store.Save(context.Background(), auth); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if remoteHasAuthFile(t, remoteDir, "master", "auths/export-only.json") {
+		t.Fatal("export mode pushed on Save, want deferred until Flush")
+	}
+	if err := store.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if !remoteHasAuthFile(t, remoteDir, "master", "auths/export-only.json") {
+		t.Fatal("export mode missing remote file after Flush")
+	}
 }

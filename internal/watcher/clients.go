@@ -438,10 +438,69 @@ func (w *Watcher) persistAuthAsync(message string, paths ...string) {
 	if len(filtered) == 0 {
 		return
 	}
+
+	// Database/object stores persist immediately so durability is not delayed.
+	// Git opts into coalescing via authPersistCoalescer to absorb bulk file storms.
+	if !w.coalesceAuthPersist {
+		msg := message
+		pathsCopy := append([]string(nil), filtered...)
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if err := w.storePersister.PersistAuthFiles(ctx, msg, pathsCopy...); err != nil {
+				log.Errorf("failed to persist auth changes: %v", err)
+			}
+		}()
+		return
+	}
+
+	w.authPersistMu.Lock()
+	defer w.authPersistMu.Unlock()
+	if w.authPersistPaths == nil {
+		w.authPersistPaths = make(map[string]struct{})
+	}
+	for _, p := range filtered {
+		w.authPersistPaths[p] = struct{}{}
+	}
+	if strings.TrimSpace(message) != "" {
+		// Keep the latest non-empty message; bulk storms use a generic one on flush.
+		w.authPersistMessage = message
+	}
+	if w.authPersistTimer != nil {
+		w.authPersistTimer.Stop()
+	}
+	w.authPersistTimer = time.AfterFunc(authPersistDebounce, w.flushAuthPersist)
+}
+
+// flushAuthPersist sends coalesced auth paths to the token store in one call.
+func (w *Watcher) flushAuthPersist() {
+	if w == nil || w.storePersister == nil {
+		return
+	}
+	w.authPersistMu.Lock()
+	pathsMap := w.authPersistPaths
+	message := w.authPersistMessage
+	w.authPersistPaths = nil
+	w.authPersistMessage = ""
+	w.authPersistTimer = nil
+	w.authPersistMu.Unlock()
+
+	if len(pathsMap) == 0 {
+		return
+	}
+	paths := make([]string, 0, len(pathsMap))
+	for p := range pathsMap {
+		paths = append(paths, p)
+	}
+	if strings.TrimSpace(message) == "" {
+		message = "Sync auth changes"
+	} else if len(paths) > 1 {
+		message = fmt.Sprintf("Sync %d auth changes", len(paths))
+	}
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		if err := w.storePersister.PersistAuthFiles(ctx, message, filtered...); err != nil {
+		if err := w.storePersister.PersistAuthFiles(ctx, message, paths...); err != nil {
 			log.Errorf("failed to persist auth changes: %v", err)
 		}
 	}()

@@ -168,6 +168,7 @@ func main() {
 		gitStoreLocalPath    string
 		gitStoreInst         *store.GitTokenStore
 		gitStoreRoot         string
+		gitStoreSyncMode     string
 		useObjectStore       bool
 		objectStoreEndpoint  string
 		objectStoreAccess    string
@@ -243,6 +244,9 @@ func main() {
 	}
 	if value, ok := lookupEnv("GITSTORE_GIT_BRANCH", "gitstore_git_branch"); ok {
 		gitStoreBranch = value
+	}
+	if value, ok := lookupEnv("GITSTORE_SYNC_MODE", "gitstore_sync_mode"); ok {
+		gitStoreSyncMode = value
 	}
 	if value, ok := lookupEnv("OBJECTSTORE_ENDPOINT", "objectstore_endpoint"); ok {
 		useObjectStore = true
@@ -477,7 +481,7 @@ func main() {
 		}
 		gitStoreRoot = filepath.Join(gitStoreLocalPath, "gitstore")
 		authDir := filepath.Join(gitStoreRoot, "auths")
-		gitStoreInst = store.NewGitTokenStore(gitStoreRemoteURL, gitStoreUser, gitStorePassword, gitStoreBranch)
+		gitStoreInst = store.NewGitTokenStoreWithMode(gitStoreRemoteURL, gitStoreUser, gitStorePassword, gitStoreBranch, store.ParseGitSyncMode(gitStoreSyncMode))
 		gitStoreInst.SetBaseDir(authDir)
 		if errRepo := gitStoreInst.EnsureRepository(); errRepo != nil {
 			log.Errorf("failed to prepare git token store: %v", errRepo)
@@ -509,7 +513,7 @@ func main() {
 		cfg, err = config.LoadConfigOptional(configFilePath, isCloudDeploy)
 		if err == nil {
 			cfg.AuthDir = gitStoreInst.AuthDir()
-			log.Infof("git-backed token store enabled, repository path: %s", gitStoreRoot)
+			log.Infof("git-backed token store enabled, repository path: %s, sync mode: %s", gitStoreRoot, gitStoreInst.SyncMode())
 		}
 	} else if configPath != "" {
 		configFilePath = configPath

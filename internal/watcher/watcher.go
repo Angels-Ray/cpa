@@ -25,6 +25,13 @@ type storePersister interface {
 	PersistAuthFiles(ctx context.Context, message string, paths ...string) error
 }
 
+// authPersistCoalescer is implemented by stores that benefit from merging rapid
+// PersistAuthFiles calls (e.g. git force-push). Database/object stores should not
+// implement this so file events stay immediately durable.
+type authPersistCoalescer interface {
+	CoalesceAuthPersist() bool
+}
+
 type authDirProvider interface {
 	AuthDir() string
 }
@@ -62,6 +69,14 @@ type Watcher struct {
 	pluginAuthParser  synthesizer.PluginAuthParser
 	mirroredAuthDir   string
 	oldConfigYaml     []byte
+
+	// Coalesce high-frequency PersistAuthFiles calls for stores that opt in
+	// (see authPersistCoalescer). Database backends leave this unused.
+	coalesceAuthPersist bool
+	authPersistMu       sync.Mutex
+	authPersistPaths    map[string]struct{}
+	authPersistMessage  string
+	authPersistTimer    *time.Timer
 }
 
 // AuthUpdateAction represents the type of change detected in auth sources.
@@ -87,6 +102,8 @@ const (
 	configReloadDebounce     = 150 * time.Millisecond
 	authRemoveDebounceWindow = 1 * time.Second
 	serverUpdateDebounce     = 1 * time.Second
+	// authPersistDebounce merges rapid auth file events into one PersistAuthFiles call.
+	authPersistDebounce = 2000 * time.Millisecond
 )
 
 // NewWatcher creates a new file watcher instance
@@ -107,6 +124,10 @@ func NewWatcher(configPath, authDir string, reloadCallback func(*config.Config))
 	if store := sdkAuth.GetTokenStore(); store != nil {
 		if persister, ok := store.(storePersister); ok {
 			w.storePersister = persister
+			if coalescer, okCoalesce := store.(authPersistCoalescer); okCoalesce && coalescer.CoalesceAuthPersist() {
+				w.coalesceAuthPersist = true
+				log.Debug("token store requested auth persist coalescing")
+			}
 			log.Debug("persistence-capable token store detected; watcher will propagate persisted changes")
 		}
 		if provider, ok := store.(authDirProvider); ok {

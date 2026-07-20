@@ -1572,8 +1572,31 @@ func TestPersistConfigAndAuthAsyncInvokePersister(t *testing.T) {
 	if store.lastAuthMessage != "msg" {
 		t.Fatalf("unexpected auth message: %s", store.lastAuthMessage)
 	}
-	if len(store.lastAuthPaths) != 2 || store.lastAuthPaths[0] != "a" || store.lastAuthPaths[1] != "b" {
+	if len(store.lastAuthPaths) != 2 {
 		t.Fatalf("unexpected filtered paths: %#v", store.lastAuthPaths)
+	}
+	got := map[string]bool{store.lastAuthPaths[0]: true, store.lastAuthPaths[1]: true}
+	if !got["a"] || !got["b"] {
+		t.Fatalf("unexpected filtered paths: %#v", store.lastAuthPaths)
+	}
+}
+
+func TestPersistAuthAsyncCoalescesBurst(t *testing.T) {
+	store := &stubStore{}
+	w := &Watcher{storePersister: store, coalesceAuthPersist: true}
+	for i := 0; i < 20; i++ {
+		w.persistAuthAsync("msg", "a.json", "b.json")
+	}
+	time.Sleep(authPersistDebounce + 80*time.Millisecond)
+	if atomic.LoadInt32(&store.authPersisted) != 1 {
+		t.Fatalf("expected one coalesced PersistAuthFiles call, got %d", store.authPersisted)
+	}
+	got := map[string]bool{}
+	for _, p := range store.lastAuthPaths {
+		got[p] = true
+	}
+	if !got["a.json"] || !got["b.json"] {
+		t.Fatalf("expected a.json and b.json, got %#v", store.lastAuthPaths)
 	}
 }
 
