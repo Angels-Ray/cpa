@@ -5,7 +5,7 @@ English | [中文](README_CN.md) | [日本語](README_JA.md)
 ### This fork (`Angels-Ray/cpa`)
 
 - `scripts/cpa-fork-release.sh` — local helper: push current branch, create date tag `vYYYY.MM.DD` (same day: `.1`, `.2`, …), trigger GitHub Actions `release` (multi-platform binaries).
-- `scripts/cpa-fork-installer.sh` — server helper: download latest (or pinned) Release asset into `~/cliproxyapi` and install/upgrade (like the official installer).
+- `scripts/cpa-fork-installer.sh` — server helper: download latest (or pinned) Release asset into `~/cliproxyapi` and install/upgrade (like the official installer). Optional `PGSTORE_DSN` enables Postgres (only DSN is needed; spool defaults to `WorkingDirectory/pgstore`). 
 
 ```bash
 # Local: release
@@ -13,6 +13,10 @@ English | [中文](README_CN.md) | [日本語](README_JA.md)
 
 # Server: install / upgrade
 curl -fsSL https://raw.githubusercontent.com/Angels-Ray/cpa/main/scripts/cpa-fork-installer.sh | bash
+
+# Server: install with Postgres (DSN alone enables pgstore)
+PGSTORE_DSN='postgresql://user:pass%26@host:5432/db?sslmode=require' \
+  bash <(curl -fsSL https://raw.githubusercontent.com/Angels-Ray/cpa/main/scripts/cpa-fork-installer.sh)
 ```
 
 A proxy server that provides OpenAI/Gemini/Claude/Codex/Grok compatible API interfaces for CLI.

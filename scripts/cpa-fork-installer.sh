@@ -16,6 +16,7 @@
 #   RESTART_SERVICE=1     # restart user systemd unit if it was running
 #   WAIT_ASSETS=1
 #   WAIT_TIMEOUT=900
+#   PGSTORE_DSN=          # optional; only this is needed to enable Postgres (written to systemd unit, %%-escaped)
 
 set -euo pipefail
 
@@ -28,6 +29,8 @@ SKIP_SYSTEMD="${SKIP_SYSTEMD:-0}"
 RESTART_SERVICE="${RESTART_SERVICE:-1}"
 WAIT_ASSETS="${WAIT_ASSETS:-1}"
 WAIT_TIMEOUT="${WAIT_TIMEOUT:-900}"
+# Optional Postgres store: only DSN is required. Spool defaults to WorkingDirectory/pgstore.
+PGSTORE_DSN="${PGSTORE_DSN:-}"
 SCRIPT_NAME="cpa-fork-installer.sh"
 
 API_BASE="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}"
@@ -62,11 +65,19 @@ Env:
   SKIP_SYSTEMD    1 to skip user systemd unit
   WAIT_ASSETS     1 to wait while CI uploads assets (default: 1)
   WAIT_TIMEOUT    seconds (default: 900)
+  PGSTORE_DSN     set this alone to enable Postgres (unit gets %%-escaped DSN)
+
+Notes:
+  - Only PGSTORE_DSN is needed; spool defaults to WorkingDirectory/pgstore (no LOCAL_PATH).
+  - Pass a normal DSN (password may contain %26); installer escapes % for systemd.
+  - Upgrade keeps existing unit PGSTORE_DSN unless you pass a new one.
+  - Does not write .env.
 
 Examples:
   ${SCRIPT_NAME}
   ${SCRIPT_NAME} status
   RELEASE_TAG=v2026.07.20 ${SCRIPT_NAME}
+  PGSTORE_DSN='postgresql://u:p%26@host:5432/db?sslmode=require' ${SCRIPT_NAME}
   REPO_OWNER=Angels-Ray REPO_NAME=cpa ${SCRIPT_NAME} upgrade
 
 Official-style one-liner (file must exist on that branch):
@@ -337,12 +348,62 @@ stop_loose_processes() {
   fi
 }
 
+# systemd Environment= treats % as a specifier; literal % must be written as %%.
+# Output a full Environment="KEY=value" line (quoted).
+systemd_environment_line() {
+  local key="$1"
+  local value="$2"
+  local escaped
+  escaped="${value//%/%%}"
+  # Escape embedded double-quotes for unit file quoting.
+  escaped="${escaped//\"/\\\"}"
+  printf 'Environment="%s=%s"\n' "$key" "$escaped"
+}
+
+# Read KEY from an existing unit Environment= line (supports quoted/unquoted).
+# Reverses systemd %% → % in the value.
+read_unit_environment() {
+  local unit_file="$1"
+  local key="$2"
+  [[ -f "$unit_file" ]] || return 0
+
+  local line raw val
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    case "$line" in
+      Environment=*)
+        raw="${line#Environment=}"
+        # Strip surrounding quotes on the whole assignment if present.
+        if [[ "$raw" == \"*\" ]]; then
+          raw="${raw:1:${#raw}-2}"
+        fi
+        if [[ "$raw" == "${key}="* ]]; then
+          val="${raw#"${key}="}"
+          # Unescape systemd percent: %% → %
+          val="${val//%%/%}"
+          printf '%s' "$val"
+          return 0
+        fi
+        ;;
+    esac
+  done <"$unit_file"
+  return 0
+}
+
 create_systemd_service() {
   local install_dir="$1"
   local systemd_dir="$HOME/.config/systemd/user"
   local unit="${systemd_dir}/cliproxyapi.service"
   mkdir -p "$systemd_dir"
-  cat >"$unit" <<EOF
+
+  # Only PGSTORE_DSN is managed. Installer env wins; else keep existing unit value.
+  # App defaults spool to WorkingDirectory/pgstore — no PGSTORE_LOCAL_PATH needed.
+  local dsn="${PGSTORE_DSN}"
+  if [[ -z "$dsn" ]]; then
+    dsn="$(read_unit_environment "$unit" "PGSTORE_DSN" || true)"
+  fi
+
+  {
+    cat <<EOF
 [Unit]
 Description=CLIProxyAPI Service (fork install)
 After=network.target
@@ -353,14 +414,26 @@ WorkingDirectory=${install_dir}
 ExecStart=${install_dir}/cli-proxy-api
 Restart=always
 RestartSec=10
-Environment=HOME=${HOME}
+EOF
+    systemd_environment_line "HOME" "${HOME}"
+    if [[ -n "$dsn" ]]; then
+      systemd_environment_line "PGSTORE_DSN" "$dsn"
+      log_info "systemd: PGSTORE_DSN set (percent chars escaped as %%)"
+      log_info "spool defaults to ${install_dir}/pgstore (WorkingDirectory/pgstore)"
+    fi
+    cat <<'EOF'
 
 [Install]
 WantedBy=default.target
 EOF
+  } >"$unit"
+
   systemctl --user daemon-reload 2>/dev/null || log_warn "daemon-reload failed (ok if no systemd user session)"
   cp "$unit" "${install_dir}/cliproxyapi.service" 2>/dev/null || true
   log_ok "systemd unit: ${unit}"
+  if [[ -n "$dsn" ]]; then
+    log_info "Postgres store enabled in unit; after start look for: postgres-backed token store enabled"
+  fi
 }
 
 backup_config() {
@@ -543,6 +616,19 @@ show_status() {
     echo "service: running"
   else
     echo "service: not running"
+  fi
+
+  local unit="$HOME/.config/systemd/user/cliproxyapi.service"
+  local dsn_in_unit
+  dsn_in_unit="$(read_unit_environment "$unit" "PGSTORE_DSN" || true)"
+  if [[ -n "$dsn_in_unit" ]]; then
+    echo "pgstore: enabled (PGSTORE_DSN in systemd unit)"
+    echo "pgstore_spool: ${INSTALL_DIR}/pgstore (default WorkingDirectory/pgstore)"
+  else
+    echo "pgstore: not configured (file store mode)"
+  fi
+  if [[ -d "${INSTALL_DIR}/pgstore" ]]; then
+    echo "pgstore_dir: present"
   fi
 }
 

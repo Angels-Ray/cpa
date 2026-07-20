@@ -5,7 +5,7 @@
 ### 本 fork（`Angels-Ray/cpa`）
 
 - `scripts/cpa-fork-release.sh`：本机用。推当前分支、打日期 tag（当天首发 `vYYYY.MM.DD`，同日再发 `vYYYY.MM.DD.1` / `.2` …），触发 Actions `release`，产出多平台二进制。
-- `scripts/cpa-fork-installer.sh`：服务器用。从本 fork 的 GitHub Release 拉最新（或指定）包，装到 `~/cliproxyapi` 并支持升级（对齐官方 installer 布局）。
+- `scripts/cpa-fork-installer.sh`：服务器用。从本 fork 的 GitHub Release 拉最新（或指定）包，装到 `~/cliproxyapi` 并支持升级（对齐官方 installer 布局）。可选 **`PGSTORE_DSN`**：只设 DSN 即启用 Postgres（spool 默认 `WorkingDirectory/pgstore`）。
 
 ```bash
 # 本机发版
@@ -13,6 +13,10 @@
 
 # 服务器安装 / 升级
 curl -fsSL https://raw.githubusercontent.com/Angels-Ray/cpa/main/scripts/cpa-fork-installer.sh | bash
+
+# 服务器：启用 Postgres（只需 PGSTORE_DSN）
+PGSTORE_DSN='postgresql://user:pass%26@host:5432/db?sslmode=require' \
+  bash <(curl -fsSL https://raw.githubusercontent.com/Angels-Ray/cpa/main/scripts/cpa-fork-installer.sh)
 ```
 
 一个为 CLI 提供 OpenAI/Gemini/Claude/Codex/Grok 兼容 API 接口的代理服务器。
