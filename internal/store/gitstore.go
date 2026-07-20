@@ -20,6 +20,7 @@ import (
 	"github.com/go-git/go-git/v6/plumbing/object"
 	"github.com/go-git/go-git/v6/plumbing/transport"
 	"github.com/go-git/go-git/v6/plumbing/transport/http"
+	appconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
@@ -1061,6 +1062,8 @@ func (s *GitTokenStore) runGC(repoDir string, now time.Time) {
 }
 
 // PersistConfig commits and pushes configuration changes to git.
+// Empty or unparseable config files are refused so a truncated local file cannot
+// be force-pushed over a good remote snapshot. Missing config is a no-op.
 func (s *GitTokenStore) PersistConfig(_ context.Context) error {
 	if err := s.ensureRepositoryCached(); err != nil {
 		return err
@@ -1069,11 +1072,11 @@ func (s *GitTokenStore) PersistConfig(_ context.Context) error {
 	if configPath == "" {
 		return fmt.Errorf("git token store: config path not configured")
 	}
-	if _, err := os.Stat(configPath); err != nil {
+	if err := validateGitConfigFile(configPath); err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil
 		}
-		return fmt.Errorf("git token store: stat config: %w", err)
+		return err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1083,6 +1086,25 @@ func (s *GitTokenStore) PersistConfig(_ context.Context) error {
 	}
 	s.markDirtyLocked("Update config", rel)
 	return s.flushDirtyLocked()
+}
+
+// validateGitConfigFile rejects empty or unparseable config.yaml files.
+// Missing files return fs.ErrNotExist so callers can no-op.
+func validateGitConfigFile(configPath string) error {
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return fs.ErrNotExist
+		}
+		return fmt.Errorf("git token store: read config: %w", err)
+	}
+	if len(bytes.TrimSpace(data)) == 0 {
+		return fmt.Errorf("git token store: refuse to push empty config file %s", configPath)
+	}
+	if _, err = appconfig.LoadConfigOptional(configPath, false); err != nil {
+		return fmt.Errorf("git token store: refuse to push invalid config %s: %w", configPath, err)
+	}
+	return nil
 }
 
 // markDirtyLocked records paths and optional commit message. Caller must hold s.mu.

@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"errors"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -752,5 +754,36 @@ func TestGitTokenStoreExportModeDefersPushUntilFlush(t *testing.T) {
 	}
 	if !remoteHasAuthFile(t, remoteDir, "master", "auths/export-only.json") {
 		t.Fatal("export mode missing remote file after Flush")
+	}
+}
+
+func TestValidateGitConfigFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+
+	if err := validateGitConfigFile(path); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("missing file should return ErrNotExist, got %v", err)
+	}
+	if err := os.WriteFile(path, []byte("   \n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateGitConfigFile(path); err == nil {
+		t.Fatal("expected empty config to be refused")
+	}
+	if err := os.WriteFile(path, []byte("port: not-a-number\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// invalid yaml structure for typed config may still parse as yaml; use definitely broken
+	if err := os.WriteFile(path, []byte(": : :\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateGitConfigFile(path); err == nil {
+		t.Fatal("expected invalid config to be refused")
+	}
+	if err := os.WriteFile(path, []byte("port: 8317\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateGitConfigFile(path); err != nil {
+		t.Fatalf("valid config refused: %v", err)
 	}
 }

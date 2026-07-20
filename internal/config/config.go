@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"syscall"
 
@@ -1271,12 +1272,7 @@ func SaveConfigPreserveComments(configFile string, cfg *Config) error {
 	mergeMappingPreserve(original.Content[0], generated.Content[0])
 	normalizeCollectionNodeStyles(original.Content[0])
 
-	// Write back.
-	f, err := os.Create(configFile)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = f.Close() }()
+	// Encode fully before replacing the target so a crash cannot leave an empty file.
 	var buf bytes.Buffer
 	enc := yaml.NewEncoder(&buf)
 	enc.SetIndent(2)
@@ -1287,9 +1283,7 @@ func SaveConfigPreserveComments(configFile string, cfg *Config) error {
 	if err = enc.Close(); err != nil {
 		return err
 	}
-	data = NormalizeCommentIndentation(buf.Bytes())
-	_, err = f.Write(data)
-	return err
+	return WriteFileAtomic(configFile, NormalizeCommentIndentation(buf.Bytes()), 0o644)
 }
 
 // SaveConfigPreserveCommentsUpdateNestedScalar updates a nested scalar key path like ["a","b"]
@@ -1324,11 +1318,6 @@ func SaveConfigPreserveCommentsUpdateNestedScalar(configFile string, path []stri
 			node = next
 		}
 	}
-	f, err := os.Create(configFile)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = f.Close() }()
 	var buf bytes.Buffer
 	enc := yaml.NewEncoder(&buf)
 	enc.SetIndent(2)
@@ -1339,9 +1328,51 @@ func SaveConfigPreserveCommentsUpdateNestedScalar(configFile string, path []stri
 	if err = enc.Close(); err != nil {
 		return err
 	}
-	data = NormalizeCommentIndentation(buf.Bytes())
-	_, err = f.Write(data)
-	return err
+	return WriteFileAtomic(configFile, NormalizeCommentIndentation(buf.Bytes()), 0o644)
+}
+
+// WriteFileAtomic writes data to path via temp file + fsync + rename so readers never
+// observe a truncated target. Used for config.yaml to prevent empty/corrupt files from
+// reaching git force-push after a crash mid-write.
+func WriteFileAtomic(path string, data []byte, mode os.FileMode) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, ".config-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	cleanup := true
+	defer func() {
+		_ = tmp.Close()
+		if cleanup {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if _, err = tmp.Write(data); err != nil {
+		return err
+	}
+	if err = tmp.Chmod(mode); err != nil {
+		return err
+	}
+	if err = tmp.Sync(); err != nil {
+		return err
+	}
+	if err = tmp.Close(); err != nil {
+		return err
+	}
+	if err = os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	cleanup = false
+	// Best-effort directory fsync so the rename is durable on power loss.
+	if dirFile, errOpen := os.Open(dir); errOpen == nil {
+		_ = dirFile.Sync()
+		_ = dirFile.Close()
+	}
+	return nil
 }
 
 // NormalizeCommentIndentation removes indentation from standalone YAML comment lines to keep them left aligned.
