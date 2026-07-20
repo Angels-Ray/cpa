@@ -339,6 +339,35 @@ func (m *Manager) syncScheduler() {
 	m.syncSchedulerFromSnapshot(m.snapshotAuths())
 }
 
+// syncSchedulerProviders incrementally upserts auths for the given providers into
+// the scheduler without cloning the full auth table. Used on the request path when
+// a scheduler pick fails and needs a targeted refresh.
+func (m *Manager) syncSchedulerProviders(providers ...string) {
+	if m == nil || m.scheduler == nil {
+		return
+	}
+	keys := normalizeProviderKeys(providers)
+	if len(keys) == 0 {
+		m.syncScheduler()
+		return
+	}
+
+	m.mu.RLock()
+	snapshots := make([]*Auth, 0, 32)
+	m.forAuthsOfProvidersLocked(keys, func(auth *Auth) bool {
+		if auth == nil {
+			return false
+		}
+		snapshots = append(snapshots, auth.Clone())
+		return false
+	})
+	m.mu.RUnlock()
+
+	for _, snapshot := range snapshots {
+		m.scheduler.upsertAuth(snapshot)
+	}
+}
+
 func (m *Manager) snapshotAuths() []*Auth {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -1601,13 +1630,13 @@ func (m *Manager) pickViaBuiltinScheduler(ctx context.Context, strategy schedule
 		if providerKey == "mixed" {
 			selected, _, errPick = m.scheduler.pickMixedWithStrategy(ctx, providers, model, opts, tried, strategy)
 			if errPick != nil && model != "" && shouldRetrySchedulerPick(errPick) {
-				m.syncScheduler()
+				m.syncSchedulerProviders(providers...)
 				selected, _, errPick = m.scheduler.pickMixedWithStrategy(ctx, providers, model, opts, tried, strategy)
 			}
 		} else {
 			selected, errPick = m.scheduler.pickSingleWithStrategy(ctx, providerKey, model, opts, tried, strategy)
 			if errPick != nil && model != "" && shouldRetrySchedulerPick(errPick) {
-				m.syncScheduler()
+				m.syncSchedulerProviders(providerKey)
 				selected, errPick = m.scheduler.pickSingleWithStrategy(ctx, providerKey, model, opts, tried, strategy)
 			}
 		}
@@ -5005,7 +5034,7 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 	for {
 		selected, errPick := m.scheduler.pickSingle(ctx, provider, model, opts, tried)
 		if errPick != nil && model != "" && shouldRetrySchedulerPick(errPick) {
-			m.syncScheduler()
+			m.syncSchedulerProviders(provider)
 			selected, errPick = m.scheduler.pickSingle(ctx, provider, model, opts, tried)
 		}
 		if errPick != nil {
@@ -5190,7 +5219,7 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 	for {
 		selected, providerKey, errPick := m.scheduler.pickMixed(ctx, eligibleProviders, model, opts, tried)
 		if errPick != nil && model != "" && shouldRetrySchedulerPick(errPick) {
-			m.syncScheduler()
+			m.syncSchedulerProviders(eligibleProviders...)
 			selected, providerKey, errPick = m.scheduler.pickMixed(ctx, eligibleProviders, model, opts, tried)
 		}
 		if errPick != nil {
