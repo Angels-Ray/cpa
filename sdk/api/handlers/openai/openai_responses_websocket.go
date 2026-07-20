@@ -1084,7 +1084,11 @@ func (h *OpenAIResponsesAPIHandler) responsesWebsocketAvailableAuthsForModel(mod
 
 	registryRef := registry.GetGlobalRegistry()
 	now := time.Now()
-	auths := h.AuthManager.List()
+	providers := make([]string, 0, len(providerSet))
+	for providerKey := range providerSet {
+		providers = append(providers, providerKey)
+	}
+	auths := h.AuthManager.ListByProviders(providers...)
 	available := make([]*coreauth.Auth, 0, len(auths))
 	for _, auth := range auths {
 		if !responsesWebsocketAuthMatchesModel(auth, providerSet, modelKey, registryRef, now) {

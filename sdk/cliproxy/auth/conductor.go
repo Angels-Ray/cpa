@@ -4749,6 +4749,37 @@ func (m *Manager) List() []*Auth {
 	return list
 }
 
+// ListByProviders returns cloned auth entries for the given provider keys only.
+// Provider keys are normalized (lowercased). Empty providers returns nil.
+// When the provider index is empty but m.auths is populated (tests writing
+// m.auths directly), falls back to a filtered full scan.
+func (m *Manager) ListByProviders(providers ...string) []*Auth {
+	if m == nil {
+		return nil
+	}
+	keys := normalizeProviderKeys(providers)
+	if len(keys) == 0 {
+		return nil
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	capHint := 0
+	for _, key := range keys {
+		capHint += len(m.authsByProvider[key])
+	}
+	if capHint == 0 && len(m.auths) > 0 {
+		capHint = len(m.auths)
+	}
+	list := make([]*Auth, 0, capHint)
+	m.forAuthsOfProvidersLocked(keys, func(auth *Auth) bool {
+		if auth != nil {
+			list = append(list, auth.Clone())
+		}
+		return false
+	})
+	return list
+}
+
 // GetByID retrieves an auth entry by its ID.
 
 func (m *Manager) GetByID(id string) (*Auth, bool) {
