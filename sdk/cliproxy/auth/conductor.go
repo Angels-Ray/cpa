@@ -2025,64 +2025,122 @@ func (m *Manager) rebuildAPIKeyModelAliasLocked(cfg *internalconfig.Config) {
 
 	out := make(apiKeyModelAliasTable)
 	for _, auth := range m.auths {
-		if auth == nil {
-			continue
-		}
-		if strings.TrimSpace(auth.ID) == "" {
-			continue
-		}
-		if auth.AuthKind() != AuthKindAPIKey {
-			continue
-		}
-
-		byAlias := make(map[string]string)
-		provider := strings.ToLower(strings.TrimSpace(auth.Provider))
-		switch provider {
-		case "gemini":
-			if entry := resolveGeminiAPIKeyConfig(cfg, auth); entry != nil {
-				compileAPIKeyModelAliasForModels(byAlias, entry.Models)
-			}
-		case "gemini-interactions":
-			if entry := resolveInteractionsAPIKeyConfig(cfg, auth); entry != nil {
-				compileAPIKeyModelAliasForModels(byAlias, entry.Models)
-			}
-		case "claude":
-			if entry := resolveClaudeAPIKeyConfig(cfg, auth); entry != nil {
-				compileAPIKeyModelAliasForModels(byAlias, entry.Models)
-			}
-		case "codex":
-			if entry := resolveCodexAPIKeyConfig(cfg, auth); entry != nil {
-				compileAPIKeyModelAliasForModels(byAlias, entry.Models)
-			}
-		case "xai":
-			if entry := resolveXAIAPIKeyConfig(cfg, auth); entry != nil {
-				compileAPIKeyModelAliasForModels(byAlias, entry.Models)
-			}
-		case "vertex":
-			if entry := resolveVertexAPIKeyConfig(cfg, auth); entry != nil {
-				compileAPIKeyModelAliasForModels(byAlias, entry.Models)
-			}
-		default:
-			// OpenAI-compat uses config selection from auth.Attributes.
-			providerKey := ""
-			compatName := ""
-			if auth.Attributes != nil {
-				providerKey = strings.TrimSpace(auth.Attributes["provider_key"])
-				compatName = strings.TrimSpace(auth.Attributes["compat_name"])
-			}
-			if compatName != "" || strings.EqualFold(strings.TrimSpace(auth.Provider), "openai-compatibility") {
-				if entry := resolveOpenAICompatConfig(cfg, providerKey, compatName, auth.Provider); entry != nil {
-					compileAPIKeyModelAliasForModels(byAlias, entry.Models)
-				}
-			}
-		}
-
-		if len(byAlias) > 0 {
+		if byAlias := compileAPIKeyModelAliasForAuth(cfg, auth); len(byAlias) > 0 {
 			out[auth.ID] = byAlias
 		}
 	}
 
 	m.apiKeyModelAlias.Store(out)
+}
+
+// compileAPIKeyModelAliasForAuth builds the alias→upstream map for a single API-key auth.
+func compileAPIKeyModelAliasForAuth(cfg *internalconfig.Config, auth *Auth) map[string]string {
+	if auth == nil || strings.TrimSpace(auth.ID) == "" {
+		return nil
+	}
+	if auth.AuthKind() != AuthKindAPIKey {
+		return nil
+	}
+	if cfg == nil {
+		cfg = &internalconfig.Config{}
+	}
+
+	byAlias := make(map[string]string)
+	provider := strings.ToLower(strings.TrimSpace(auth.Provider))
+	switch provider {
+	case "gemini":
+		if entry := resolveGeminiAPIKeyConfig(cfg, auth); entry != nil {
+			compileAPIKeyModelAliasForModels(byAlias, entry.Models)
+		}
+	case "gemini-interactions":
+		if entry := resolveInteractionsAPIKeyConfig(cfg, auth); entry != nil {
+			compileAPIKeyModelAliasForModels(byAlias, entry.Models)
+		}
+	case "claude":
+		if entry := resolveClaudeAPIKeyConfig(cfg, auth); entry != nil {
+			compileAPIKeyModelAliasForModels(byAlias, entry.Models)
+		}
+	case "codex":
+		if entry := resolveCodexAPIKeyConfig(cfg, auth); entry != nil {
+			compileAPIKeyModelAliasForModels(byAlias, entry.Models)
+		}
+	case "xai":
+		if entry := resolveXAIAPIKeyConfig(cfg, auth); entry != nil {
+			compileAPIKeyModelAliasForModels(byAlias, entry.Models)
+		}
+	case "vertex":
+		if entry := resolveVertexAPIKeyConfig(cfg, auth); entry != nil {
+			compileAPIKeyModelAliasForModels(byAlias, entry.Models)
+		}
+	default:
+		// OpenAI-compat uses config selection from auth.Attributes.
+		providerKey := ""
+		compatName := ""
+		if auth.Attributes != nil {
+			providerKey = strings.TrimSpace(auth.Attributes["provider_key"])
+			compatName = strings.TrimSpace(auth.Attributes["compat_name"])
+		}
+		if compatName != "" || strings.EqualFold(strings.TrimSpace(auth.Provider), "openai-compatibility") {
+			if entry := resolveOpenAICompatConfig(cfg, providerKey, compatName, auth.Provider); entry != nil {
+				compileAPIKeyModelAliasForModels(byAlias, entry.Models)
+			}
+		}
+	}
+	if len(byAlias) == 0 {
+		return nil
+	}
+	return byAlias
+}
+
+// upsertAPIKeyModelAliasForAuth updates the alias table for one auth without a full rebuild.
+func (m *Manager) upsertAPIKeyModelAliasForAuth(auth *Auth) {
+	if m == nil || auth == nil || strings.TrimSpace(auth.ID) == "" {
+		return
+	}
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	if cfg == nil {
+		cfg = &internalconfig.Config{}
+	}
+	byAlias := compileAPIKeyModelAliasForAuth(cfg, auth)
+
+	current, _ := m.apiKeyModelAlias.Load().(apiKeyModelAliasTable)
+	next := make(apiKeyModelAliasTable, len(current)+1)
+	for id, aliases := range current {
+		if id == auth.ID {
+			continue
+		}
+		next[id] = aliases
+	}
+	if len(byAlias) > 0 {
+		next[auth.ID] = byAlias
+	}
+	m.apiKeyModelAlias.Store(next)
+}
+
+// removeAPIKeyModelAliasForAuth drops one auth from the alias table.
+func (m *Manager) removeAPIKeyModelAliasForAuth(authID string) {
+	if m == nil {
+		return
+	}
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return
+	}
+	current, _ := m.apiKeyModelAlias.Load().(apiKeyModelAliasTable)
+	if len(current) == 0 {
+		return
+	}
+	if _, ok := current[authID]; !ok {
+		return
+	}
+	next := make(apiKeyModelAliasTable, len(current)-1)
+	for id, aliases := range current {
+		if id == authID {
+			continue
+		}
+		next[id] = aliases
+	}
+	m.apiKeyModelAlias.Store(next)
 }
 
 func compileAPIKeyModelAliasForModels[T interface {
@@ -2205,7 +2263,7 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	m.addAuthToProviderIndexLocked(authClone)
 	m.mu.Unlock()
 	if !shouldDeferAPIKeyModelAliasRebuild(ctx) {
-		m.rebuildAPIKeyModelAliasFromRuntimeConfig()
+		m.upsertAPIKeyModelAliasForAuth(authClone)
 	}
 	if m.scheduler != nil {
 		m.scheduler.upsertAuth(authClone)
@@ -2254,7 +2312,7 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	m.addAuthToProviderIndexLocked(authClone)
 	m.mu.Unlock()
 	if !shouldDeferAPIKeyModelAliasRebuild(ctx) {
-		m.rebuildAPIKeyModelAliasFromRuntimeConfig()
+		m.upsertAPIKeyModelAliasForAuth(authClone)
 	}
 	if m.scheduler != nil {
 		m.scheduler.upsertAuth(authClone)
@@ -2304,7 +2362,7 @@ func (m *Manager) Remove(ctx context.Context, id string) {
 	m.mu.Unlock()
 
 	if !shouldDeferAPIKeyModelAliasRebuild(ctx) {
-		m.rebuildAPIKeyModelAliasFromRuntimeConfig()
+		m.removeAPIKeyModelAliasForAuth(id)
 	}
 	if m.scheduler != nil {
 		m.scheduler.removeAuth(id)
