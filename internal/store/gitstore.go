@@ -26,7 +26,14 @@ import (
 // gcInterval defines minimum time between garbage collection runs.
 const gcInterval = 5 * time.Minute
 
+// gitFlushInterval is how long dirty auth/config paths wait before a batched
+// commit+push. Short enough for operational visibility, long enough to coalesce
+// OAuth refresh storms into a single push.
+const gitFlushInterval = 2 * time.Second
+
 // GitTokenStore persists token records and auth metadata using git as the backing storage.
+// Local auth files are written synchronously; commit+push is coalesced asynchronously
+// so high-churn token refreshes do not each force a remote push.
 type GitTokenStore struct {
 	mu        sync.Mutex
 	dirLock   sync.RWMutex
@@ -38,6 +45,16 @@ type GitTokenStore struct {
 	username  string
 	password  string
 	lastGC    time.Time
+
+	// dirtyRelPaths holds repository-relative paths waiting for a batched push.
+	dirtyRelPaths map[string]struct{}
+	// pendingMessage is the commit message for the next flush (last writer wins for text).
+	pendingMessage string
+	// flushTimer triggers a batched commit+push of dirty paths.
+	flushTimer *time.Timer
+	// repoReady is set after the first successful EnsureRepository; subsequent
+	// Save/List/Delete skip network pull when the local repo is already prepared.
+	repoReady bool
 }
 
 type resolvedRemoteBranch struct {
@@ -50,10 +67,11 @@ type resolvedRemoteBranch struct {
 // When branch is non-empty, clone/pull/push operations target that branch instead of the remote default.
 func NewGitTokenStore(remote, username, password, branch string) *GitTokenStore {
 	return &GitTokenStore{
-		remote:   remote,
-		branch:   strings.TrimSpace(branch),
-		username: username,
-		password: password,
+		remote:        remote,
+		branch:        strings.TrimSpace(branch),
+		username:      username,
+		password:      password,
+		dirtyRelPaths: make(map[string]struct{}),
 	}
 }
 
@@ -248,6 +266,7 @@ func (s *GitTokenStore) EnsureRepository() error {
 		s.dirLock.Unlock()
 		return fmt.Errorf("git token store: create config dir: %w", err)
 	}
+	s.repoReady = true
 	s.dirLock.Unlock()
 	if len(initPaths) > 0 {
 		s.mu.Lock()
@@ -258,6 +277,18 @@ func (s *GitTokenStore) EnsureRepository() error {
 		}
 	}
 	return nil
+}
+
+// ensureRepositoryCached prepares the repository once. Subsequent calls skip
+// clone/pull when the local repo is already ready.
+func (s *GitTokenStore) ensureRepositoryCached() error {
+	s.dirLock.RLock()
+	ready := s.repoReady && s.baseDir != "" && s.remote != ""
+	s.dirLock.RUnlock()
+	if ready {
+		return nil
+	}
+	return s.EnsureRepository()
 }
 
 // Save persists token storage and metadata to the resolved auth file path.
@@ -280,7 +311,7 @@ func (s *GitTokenStore) Save(_ context.Context, auth *cliproxyauth.Auth) (string
 		}
 	}
 
-	if err = s.EnsureRepository(); err != nil {
+	if err = s.ensureRepositoryCached(); err != nil {
 		return "", err
 	}
 
@@ -345,16 +376,14 @@ func (s *GitTokenStore) Save(_ context.Context, auth *cliproxyauth.Auth) (string
 	if strings.TrimSpace(messageID) == "" {
 		messageID = filepath.Base(path)
 	}
-	if errCommit := s.commitAndPushLocked(fmt.Sprintf("Update auth %s", strings.TrimSpace(messageID)), relPath); errCommit != nil {
-		return "", errCommit
-	}
+	s.scheduleCommitLocked(fmt.Sprintf("Update auth %s", strings.TrimSpace(messageID)), relPath)
 
 	return path, nil
 }
 
 // List enumerates all auth JSON files under the configured directory.
 func (s *GitTokenStore) List(_ context.Context) ([]*cliproxyauth.Auth, error) {
-	if err := s.EnsureRepository(); err != nil {
+	if err := s.ensureRepositoryCached(); err != nil {
 		return nil, err
 	}
 	dir := s.baseDirSnapshot()
@@ -397,7 +426,7 @@ func (s *GitTokenStore) Delete(_ context.Context, id string) error {
 	if err != nil {
 		return err
 	}
-	if err = s.EnsureRepository(); err != nil {
+	if err = s.ensureRepositoryCached(); err != nil {
 		return err
 	}
 
@@ -412,10 +441,7 @@ func (s *GitTokenStore) Delete(_ context.Context, id string) error {
 		if errRel != nil {
 			return errRel
 		}
-		messageID := id
-		if errCommit := s.commitAndPushLocked(fmt.Sprintf("Delete auth %s", messageID), rel); errCommit != nil {
-			return errCommit
-		}
+		s.scheduleCommitLocked(fmt.Sprintf("Delete auth %s", id), rel)
 	}
 	return nil
 }
@@ -426,7 +452,7 @@ func (s *GitTokenStore) PersistAuthFiles(_ context.Context, message string, path
 	if len(paths) == 0 {
 		return nil
 	}
-	if err := s.EnsureRepository(); err != nil {
+	if err := s.ensureRepositoryCached(); err != nil {
 		return err
 	}
 
@@ -452,7 +478,14 @@ func (s *GitTokenStore) PersistAuthFiles(_ context.Context, message string, path
 	if strings.TrimSpace(message) == "" {
 		message = "Sync watcher updates"
 	}
-	return s.commitAndPushLocked(message, filtered...)
+	// Explicit persist coalesces pending dirty paths into one push.
+	for _, rel := range filtered {
+		s.dirtyRelPaths[rel] = struct{}{}
+	}
+	if s.pendingMessage == "" {
+		s.pendingMessage = message
+	}
+	return s.flushDirtyLocked()
 }
 
 func (s *GitTokenStore) resolveDeletePath(id string) (string, error) {
@@ -957,7 +990,7 @@ func (s *GitTokenStore) maybeRunGC(repoDir string) {
 
 // PersistConfig commits and pushes configuration changes to git.
 func (s *GitTokenStore) PersistConfig(_ context.Context) error {
-	if err := s.EnsureRepository(); err != nil {
+	if err := s.ensureRepositoryCached(); err != nil {
 		return err
 	}
 	configPath := s.ConfigPath()
@@ -976,7 +1009,75 @@ func (s *GitTokenStore) PersistConfig(_ context.Context) error {
 	if err != nil {
 		return err
 	}
-	return s.commitAndPushLocked("Update config", rel)
+	s.scheduleCommitLocked("Update config", rel)
+	return nil
+}
+
+// scheduleCommitLocked records paths for a batched async commit+push.
+// Caller must hold s.mu.
+func (s *GitTokenStore) scheduleCommitLocked(message string, relPaths ...string) {
+	if s.dirtyRelPaths == nil {
+		s.dirtyRelPaths = make(map[string]struct{})
+	}
+	for _, rel := range relPaths {
+		rel = strings.TrimSpace(rel)
+		if rel == "" {
+			continue
+		}
+		s.dirtyRelPaths[rel] = struct{}{}
+	}
+	if strings.TrimSpace(message) != "" {
+		s.pendingMessage = message
+	}
+	if s.flushTimer != nil {
+		return
+	}
+	s.flushTimer = time.AfterFunc(gitFlushInterval, func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.flushTimer = nil
+		_ = s.flushDirtyLocked()
+	})
+}
+
+// Flush commits and pushes any pending dirty paths. Safe to call multiple times.
+func (s *GitTokenStore) Flush() error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.flushTimer != nil {
+		s.flushTimer.Stop()
+		s.flushTimer = nil
+	}
+	return s.flushDirtyLocked()
+}
+
+// flushDirtyLocked commits all dirty paths in one push. Caller must hold s.mu.
+func (s *GitTokenStore) flushDirtyLocked() error {
+	if s.flushTimer != nil {
+		s.flushTimer.Stop()
+		s.flushTimer = nil
+	}
+	if len(s.dirtyRelPaths) == 0 {
+		return nil
+	}
+	paths := make([]string, 0, len(s.dirtyRelPaths))
+	for rel := range s.dirtyRelPaths {
+		paths = append(paths, rel)
+	}
+	message := s.pendingMessage
+	if strings.TrimSpace(message) == "" {
+		message = "Sync auth store"
+	}
+	err := s.commitAndPushLocked(message, paths...)
+	if err != nil {
+		return err
+	}
+	s.dirtyRelPaths = make(map[string]struct{})
+	s.pendingMessage = ""
+	return nil
 }
 
 func ensureEmptyFile(path string) error {

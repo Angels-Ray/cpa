@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -12,6 +13,7 @@ import (
 	gitconfig "github.com/go-git/go-git/v6/config"
 	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/go-git/go-git/v6/plumbing/object"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
 type testBranchSpec struct {
@@ -624,4 +626,83 @@ func assertRemoteBranchContents(t *testing.T, remoteDir, branch, wantContents st
 	if contents != wantContents {
 		t.Fatalf("remote branch %s contents = %q, want %q", branch, contents, wantContents)
 	}
+}
+
+func TestGitTokenStoreSaveBatchesPushUntilFlush(t *testing.T) {
+	root := t.TempDir()
+	remoteDir := setupGitRemoteRepository(t, root, "master",
+		testBranchSpec{name: "master", contents: "remote master branch\n"},
+	)
+
+	baseDir := filepath.Join(root, "workspace", "auths")
+	store := NewGitTokenStore(remoteDir, "", "", "master")
+	store.SetBaseDir(baseDir)
+	if err := store.EnsureRepository(); err != nil {
+		t.Fatalf("EnsureRepository: %v", err)
+	}
+
+	ctx := context.Background()
+	auth := &cliproxyauth.Auth{
+		ID:       "acct-1.json",
+		Provider: "xai",
+		FileName: "acct-1.json",
+		Metadata: map[string]any{
+			"type":         "xai",
+			"access_token": "token-1",
+			"email":        "a@example.com",
+		},
+	}
+	path, err := store.Save(ctx, auth)
+	if err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("local auth file missing: %v", err)
+	}
+
+	// Before Flush, remote should not yet contain the auth file.
+	if remoteHasAuthFile(t, remoteDir, "master", "auths/acct-1.json") {
+		t.Fatal("remote already has auth file before Flush")
+	}
+
+	if err := store.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if !remoteHasAuthFile(t, remoteDir, "master", "auths/acct-1.json") {
+		t.Fatal("remote missing auth file after Flush")
+	}
+}
+
+func remoteHasAuthFile(t *testing.T, remoteDir, branch, relPath string) bool {
+	t.Helper()
+	repo, err := git.PlainOpen(remoteDir)
+	if err != nil {
+		// bare remote may need different open; fall back to reading via temporary clone contents helper
+		// use assertRemoteBranchContents style: checkout branch file list through object
+	}
+	_ = repo
+	// Reuse existing helper pattern: try to read file from remote branch.
+	refName := plumbing.NewBranchReferenceName(branch)
+	repo, err = git.PlainOpen(remoteDir)
+	if err != nil {
+		t.Fatalf("open remote: %v", err)
+	}
+	ref, err := repo.Reference(refName, true)
+	if err != nil {
+		// bare repos store refs differently; try packed
+		ref, err = repo.Reference(plumbing.ReferenceName("refs/heads/"+branch), true)
+		if err != nil {
+			t.Fatalf("remote ref: %v", err)
+		}
+	}
+	commit, err := repo.CommitObject(ref.Hash())
+	if err != nil {
+		t.Fatalf("commit object: %v", err)
+	}
+	tree, err := commit.Tree()
+	if err != nil {
+		t.Fatalf("tree: %v", err)
+	}
+	_, err = tree.File(relPath)
+	return err == nil
 }
