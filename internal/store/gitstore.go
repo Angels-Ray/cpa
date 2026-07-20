@@ -55,6 +55,9 @@ type GitTokenStore struct {
 	// repoReady is set after the first successful EnsureRepository; subsequent
 	// Save/List/Delete skip network pull when the local repo is already prepared.
 	repoReady bool
+	// gcMu serializes background GC against commit/push object access.
+	gcMu sync.Mutex
+	gcWG sync.WaitGroup
 }
 
 type resolvedRemoteBranch struct {
@@ -205,6 +208,7 @@ func (s *GitTokenStore) EnsureRepository() error {
 		s.dirLock.Unlock()
 		return fmt.Errorf("git token store: stat repo: %w", err)
 	} else {
+		// Existing repository: checkout and pull on explicit EnsureRepository calls.
 		repo, errOpen := git.PlainOpen(repoDir)
 		if errOpen != nil {
 			s.dirLock.Unlock()
@@ -858,6 +862,9 @@ func (s *GitTokenStore) commitAndPushLocked(message string, relPaths ...string) 
 	if repoDir == "" {
 		return fmt.Errorf("git token store: repository path not configured")
 	}
+	// Serialize with background GC so prune/repack cannot delete objects mid-commit.
+	s.gcMu.Lock()
+	defer s.gcMu.Unlock()
 	repo, err := git.PlainOpen(repoDir)
 	if err != nil {
 		return fmt.Errorf("git token store: open repo: %w", err)
@@ -972,12 +979,20 @@ func (s *GitTokenStore) maybeRunGC(repoDir string) {
 		return
 	}
 	s.lastGC = now
+	// Run prune/repack asynchronously. commitAndPushLocked holds gcMu so this
+	// cannot delete objects while a commit/push is in progress.
+	s.gcWG.Add(1)
+	go s.runGC(repoDir, now)
+}
 
+func (s *GitTokenStore) runGC(repoDir string, now time.Time) {
+	defer s.gcWG.Done()
+	s.gcMu.Lock()
+	defer s.gcMu.Unlock()
 	repo, err := git.PlainOpen(repoDir)
 	if err != nil {
 		return
 	}
-
 	pruneOpts := git.PruneOptions{
 		OnlyObjectsOlderThan: now,
 		Handler:              repo.DeleteObject,
@@ -1046,12 +1061,16 @@ func (s *GitTokenStore) Flush() error {
 		return nil
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.flushTimer != nil {
 		s.flushTimer.Stop()
 		s.flushTimer = nil
 	}
-	return s.flushDirtyLocked()
+	err := s.flushDirtyLocked()
+	s.mu.Unlock()
+	// Wait for any GC scheduled by the flush push so callers (and tests) can
+	// tear down temp repositories safely.
+	s.gcWG.Wait()
+	return err
 }
 
 // flushDirtyLocked commits all dirty paths in one push. Caller must hold s.mu.

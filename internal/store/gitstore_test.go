@@ -270,6 +270,7 @@ func TestCommitAndPushLockedPushesBeforeRunningGC(t *testing.T) {
 		if err != nil {
 			t.Fatalf("commitAndPushLocked with forced GC: %v", err)
 		}
+		store.gcWG.Wait()
 
 		assertRemoteBranchContents(t, remoteDir, "master", contents)
 	}
