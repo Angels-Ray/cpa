@@ -3486,21 +3486,46 @@ func (m *Manager) AvailableProviders() []string {
 	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	seen := make(map[string]struct{}, len(m.auths))
-	out := make([]string, 0, len(m.auths))
-	for _, auth := range m.auths {
-		if auth == nil || auth.Disabled || auth.Status == StatusDisabled {
+	seen := make(map[string]struct{}, len(m.authsByProvider))
+	out := make([]string, 0, len(m.authsByProvider))
+	if len(m.authsByProvider) == 0 && len(m.auths) > 0 {
+		for _, auth := range m.auths {
+			if auth == nil || auth.Disabled || auth.Status == StatusDisabled {
+				continue
+			}
+			provider := strings.ToLower(strings.TrimSpace(auth.Provider))
+			if provider == "" {
+				continue
+			}
+			if _, ok := seen[provider]; ok {
+				continue
+			}
+			seen[provider] = struct{}{}
+			out = append(out, provider)
+		}
+		sort.Strings(out)
+		return out
+	}
+	for key, bucket := range m.authsByProvider {
+		if key == "" || len(bucket) == 0 {
 			continue
 		}
-		provider := strings.ToLower(strings.TrimSpace(auth.Provider))
-		if provider == "" {
-			continue
+		for _, auth := range bucket {
+			if auth == nil || auth.Disabled || auth.Status == StatusDisabled {
+				continue
+			}
+			// Prefer the auth Provider field for output stability with legacy callers.
+			provider := strings.ToLower(strings.TrimSpace(auth.Provider))
+			if provider == "" {
+				provider = key
+			}
+			if _, ok := seen[provider]; ok {
+				break
+			}
+			seen[provider] = struct{}{}
+			out = append(out, provider)
+			break
 		}
-		if _, ok := seen[provider]; ok {
-			continue
-		}
-		seen[provider] = struct{}{}
-		out = append(out, provider)
 	}
 	sort.Strings(out)
 	return out
@@ -3519,15 +3544,20 @@ func (m *Manager) HasProviderAuth(provider string) bool {
 	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	for _, auth := range m.auths {
-		if auth == nil || auth.Disabled || auth.Status == StatusDisabled {
-			continue
+	found := false
+	m.forAuthsOfProvidersLocked([]string{provider}, func(auth *Auth) bool {
+		if auth.Disabled || auth.Status == StatusDisabled {
+			return false
 		}
-		if strings.ToLower(strings.TrimSpace(auth.Provider)) == provider {
+		// Match either the index key (via forAuthsOfProvidersLocked) or Provider field
+		// so callers that pass auth.Provider continue to work.
+		if strings.ToLower(strings.TrimSpace(auth.Provider)) == provider || executorKeyFromAuth(auth) == provider {
+			found = true
 			return true
 		}
-	}
-	return false
+		return false
+	})
+	return found
 }
 
 func (m *Manager) retrySettings() (int, int, time.Duration) {
