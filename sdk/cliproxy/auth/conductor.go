@@ -222,9 +222,10 @@ type Manager struct {
 	executors     map[string]ProviderExecutor
 	selector      Selector
 	hook          Hook
-	mu            sync.RWMutex
-	auths         map[string]*Auth
-	scheduler     *authScheduler
+	mu              sync.RWMutex
+	auths           map[string]*Auth
+	authsByProvider map[string][]*Auth
+	scheduler       *authScheduler
 	// pluginScheduler runs outside m.mu before falling back to native selection.
 	pluginScheduler PluginScheduler
 	// homeRuntimeAuths caches auths returned by Home so websocket sessions can
@@ -2172,6 +2173,7 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	authClone := auth.Clone()
 	m.mu.Lock()
 	m.auths[auth.ID] = authClone
+	m.addAuthToProviderIndexLocked(authClone)
 	m.mu.Unlock()
 	if !shouldDeferAPIKeyModelAliasRebuild(ctx) {
 		m.rebuildAPIKeyModelAliasFromRuntimeConfig()
@@ -2217,8 +2219,10 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 		clearedCooldown = clearCooldownStateForAuth(auth, now)
 	}
 	auth.EnsureIndex()
+	m.removeAuthFromProviderIndexLocked(existing)
 	authClone := auth.Clone()
 	m.auths[auth.ID] = authClone
+	m.addAuthToProviderIndexLocked(authClone)
 	m.mu.Unlock()
 	if !shouldDeferAPIKeyModelAliasRebuild(ctx) {
 		m.rebuildAPIKeyModelAliasFromRuntimeConfig()
@@ -2254,6 +2258,7 @@ func (m *Manager) Remove(ctx context.Context, id string) {
 		return
 	}
 	provider := strings.TrimSpace(existing.Provider)
+	m.removeAuthFromProviderIndexLocked(existing)
 	delete(m.auths, id)
 	if m.modelPoolOffsets != nil {
 		delete(m.modelPoolOffsets, id)
@@ -2310,12 +2315,14 @@ func (m *Manager) Load(ctx context.Context) error {
 		return err
 	}
 	m.auths = make(map[string]*Auth, len(items))
+	m.authsByProvider = make(map[string][]*Auth)
 	for _, auth := range items {
 		if auth == nil || auth.ID == "" {
 			continue
 		}
 		auth.EnsureIndex()
 		m.auths[auth.ID] = auth
+		m.addAuthToProviderIndexLocked(auth)
 	}
 	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
 	if cfg == nil {
@@ -4834,9 +4841,13 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		m.mu.RUnlock()
 		return nil, nil, &Error{Code: "executor_not_found", Message: "executor not registered"}
 	}
-	candidates := make([]*Auth, 0, len(m.auths))
+	providerAuths := m.authsByProvider[provider]
+	useFallback := len(providerAuths) == 0 && len(m.auths) > 0
+	if useFallback {
+		providerAuths = authSliceFromMap(m.auths)
+	}
+	candidates := make([]*Auth, 0, len(providerAuths))
 	modelKey := strings.TrimSpace(model)
-	// Always use base model name (without thinking suffix) for auth matching.
 	if modelKey != "" {
 		parsed := thinking.ParseSuffix(modelKey)
 		if parsed.ModelName != "" {
@@ -4844,8 +4855,11 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		}
 	}
 	registryRef := registry.GetGlobalRegistry()
-	for _, candidate := range m.auths {
-		if candidate == nil || executorKeyFromAuth(candidate) != provider || candidate.Disabled {
+	for _, candidate := range providerAuths {
+		if candidate == nil || candidate.Disabled {
+			continue
+		}
+		if useFallback && executorKeyFromAuth(candidate) != provider {
 			continue
 		}
 		if pinnedAuthID != "" && candidate.ID != pinnedAuthID {
@@ -4960,8 +4974,8 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 	}
 	if strings.TrimSpace(model) != "" {
 		m.mu.RLock()
-		for _, candidate := range m.auths {
-			if candidate == nil || executorKeyFromAuth(candidate) != provider || candidate.Disabled {
+		for _, candidate := range m.authsByProvider[provider] {
+			if candidate == nil || candidate.Disabled {
 				continue
 			}
 			if _, used := tried[candidate.ID]; used {
@@ -5034,9 +5048,12 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	m.mu.RLock()
 	selector := m.selector
 	pluginScheduler := m.pluginScheduler
-	candidates := make([]*Auth, 0, len(m.auths))
+	totalCap := 0
+	for providerKey := range providerSet {
+		totalCap += len(m.authsByProvider[providerKey])
+	}
+	candidates := make([]*Auth, 0, totalCap)
 	modelKey := strings.TrimSpace(model)
-	// Always use base model name (without thinking suffix) for auth matching.
 	if modelKey != "" {
 		parsed := thinking.ParseSuffix(modelKey)
 		if parsed.ModelName != "" {
@@ -5044,33 +5061,28 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		}
 	}
 	registryRef := registry.GetGlobalRegistry()
-	for _, candidate := range m.auths {
-		if candidate == nil || candidate.Disabled {
-			continue
-		}
-		if pinnedAuthID != "" && candidate.ID != pinnedAuthID {
-			continue
-		}
-		if disallowFreeAuth && isFreeCodexAuth(candidate) {
-			continue
-		}
-		providerKey := executorKeyFromAuth(candidate)
-		if providerKey == "" {
-			continue
-		}
-		if _, ok := providerSet[providerKey]; !ok {
-			continue
-		}
-		if _, used := tried[candidate.ID]; used {
-			continue
-		}
+	for providerKey := range providerSet {
 		if _, ok := m.executors[providerKey]; !ok {
 			continue
 		}
-		if modelKey != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
-			continue
+		for _, candidate := range m.authsByProvider[providerKey] {
+			if candidate == nil || candidate.Disabled {
+				continue
+			}
+			if pinnedAuthID != "" && candidate.ID != pinnedAuthID {
+				continue
+			}
+			if disallowFreeAuth && isFreeCodexAuth(candidate) {
+				continue
+			}
+			if _, used := tried[candidate.ID]; used {
+				continue
+			}
+			if modelKey != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
+				continue
+			}
+			candidates = append(candidates, candidate)
 		}
-		candidates = append(candidates, candidate)
 	}
 	if len(candidates) == 0 {
 		m.mu.RUnlock()
@@ -5148,19 +5160,18 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 			providerSet[providerKey] = struct{}{}
 		}
 		m.mu.RLock()
-		for _, candidate := range m.auths {
-			if candidate == nil || candidate.Disabled {
-				continue
-			}
-			if _, ok := providerSet[executorKeyFromAuth(candidate)]; !ok {
-				continue
-			}
-			if _, used := tried[candidate.ID]; used {
-				continue
-			}
-			if m.routeAwareSelectionRequired(candidate, model) {
-				m.mu.RUnlock()
-				return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
+		for providerKey := range providerSet {
+			for _, candidate := range m.authsByProvider[providerKey] {
+				if candidate == nil || candidate.Disabled {
+					continue
+				}
+				if _, used := tried[candidate.ID]; used {
+					continue
+				}
+				if m.routeAwareSelectionRequired(candidate, model) {
+					m.mu.RUnlock()
+					return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
+				}
 			}
 		}
 		m.mu.RUnlock()
@@ -6321,6 +6332,41 @@ type RequestPreparer interface {
 	PrepareRequest(req *http.Request, auth *Auth) error
 }
 
+// addAuthToProviderIndexLocked inserts an auth into the provider-keyed index.
+// Must be called with m.mu held.
+func (m *Manager) addAuthToProviderIndexLocked(auth *Auth) {
+	if auth == nil {
+		return
+	}
+	key := executorKeyFromAuth(auth)
+	if key == "" {
+		return
+	}
+	if m.authsByProvider == nil {
+		m.authsByProvider = make(map[string][]*Auth)
+	}
+	m.authsByProvider[key] = append(m.authsByProvider[key], auth)
+}
+
+// removeAuthFromProviderIndexLocked removes an auth from the provider-keyed index.
+// Must be called with m.mu held.
+func (m *Manager) removeAuthFromProviderIndexLocked(auth *Auth) {
+	if auth == nil || m.authsByProvider == nil {
+		return
+	}
+	key := executorKeyFromAuth(auth)
+	if key == "" {
+		return
+	}
+	slice := m.authsByProvider[key]
+	for i, a := range slice {
+		if a == auth {
+			m.authsByProvider[key] = append(slice[:i], slice[i+1:]...)
+			return
+		}
+	}
+}
+
 func executorKeyFromAuth(auth *Auth) string {
 	if auth == nil {
 		return ""
@@ -6507,4 +6553,12 @@ func (m *Manager) HttpRequest(ctx context.Context, auth *Auth, req *http.Request
 		return nil, &Error{Code: "provider_not_found", Message: "executor not registered for provider: " + providerKey}
 	}
 	return exec.HttpRequest(ctx, auth, req)
+}
+
+func authSliceFromMap(m map[string]*Auth) []*Auth {
+	s := make([]*Auth, 0, len(m))
+	for _, a := range m {
+		s = append(s, a)
+	}
+	return s
 }
